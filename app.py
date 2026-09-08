@@ -48,6 +48,12 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "faktury-osvc").strip() or "faktury-osvc"
 SUPABASE_DB_OBJECT = os.environ.get("SUPABASE_DB_OBJECT", "data/invoice_app.db").strip() or "data/invoice_app.db"
 REMOTE_DB_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+SUPABASE_KEY_KIND = (
+    "new_secret" if SUPABASE_SERVICE_KEY.startswith("sb_secret_")
+    else "legacy_service_role" if SUPABASE_SERVICE_KEY.startswith("eyJ")
+    else "unknown" if SUPABASE_SERVICE_KEY
+    else "missing"
+)
 
 import shutil
 import tempfile
@@ -1349,10 +1355,14 @@ def _supabase_object_url(object_path: str, authenticated: bool = False) -> str:
 
 
 def _supabase_headers(content_type: str | None = None) -> dict[str, str]:
-    headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "apikey": SUPABASE_SERVICE_KEY,
-    }
+    """
+    Obsługuje oba formaty kluczy Supabase:
+    - nowy secret key: sb_secret_... -> tylko nagłówek apikey
+    - legacy service_role JWT: eyJ... -> apikey + Authorization Bearer
+    """
+    headers = {"apikey": SUPABASE_SERVICE_KEY}
+    if not SUPABASE_SERVICE_KEY.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
     if content_type:
         headers["Content-Type"] = content_type
     return headers
@@ -1375,7 +1385,12 @@ def download_remote_database() -> bool:
             if exc.code == 404:
                 print("Supabase: brak zdalnej bazy — przy pierwszym uruchomieniu zostanie utworzona nowa.")
                 return False
-            print(f"Supabase: nie udało się pobrać bazy (HTTP {exc.code}).")
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            print(f"Supabase: nie udało się pobrać bazy (HTTP {exc.code}): {body}")
             return False
         except Exception as exc:
             print(f"Supabase: nie udało się pobrać bazy: {exc}")
@@ -2530,7 +2545,14 @@ def app_icon():
 
 @app.route("/health")
 def health():
-    return {"status":"ok"}
+    return {
+        "status": "ok",
+        "cloud_mode": CLOUD_MODE,
+        "supabase_configured": REMOTE_DB_ENABLED,
+        "supabase_bucket": SUPABASE_BUCKET if REMOTE_DB_ENABLED else None,
+        "supabase_key_kind": SUPABASE_KEY_KIND,
+        "database_exists": DB_PATH.exists(),
+    }
 
 
 
@@ -4172,9 +4194,10 @@ if __name__ == "__main__":
     if MIGRATED_FROM:
         print(f"Zaimportowano dane ze starej aplikacji: {MIGRATED_FROM}")
         print(f"Nowa baza danych: {DB_PATH}")
-    print("Faktury OSVČ V7.2 FREE Web/PWA")
+    print("Faktury OSVČ V7.3 FREE Web/PWA")
     print(f"Baza danych: {DB_PATH}")
     print(f"Faktury PDF: {INVOICE_PDF_DIR}")
+    print(f"Supabase configured: {REMOTE_DB_ENABLED}; bucket={SUPABASE_BUCKET}; key_kind={SUPABASE_KEY_KIND}")
     port = int(os.environ.get("PORT", "5000"))
     if not CLOUD_MODE:
         threading.Timer(1.2, open_browser).start()
