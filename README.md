@@ -1,37 +1,39 @@
-# Faktury OSVČ V7.1 Web/PWA
+# Faktury OSVČ V7.2 FREE
 
-Wersja mobilna i desktopowa tej samej aplikacji.
+Wariant w pełni darmowy:
+- Render Free Web Service — uruchamia aplikację,
+- Supabase Free Storage — przechowuje prywatny plik SQLite,
+- brak Persistent Disk i brak płatnego planu Render.
 
-## Co nowego
-- responsywny interfejs na telefon i laptop,
-- PWA: można dodać ikonę na ekran główny,
-- jedno hasło do aplikacji online,
-- automatyczna kopia bazy raz dziennie (14 ostatnich),
-- zapisywanie numerów projektów i wybór projektu przy wystawianiu faktury,
-- zachowane moduły faktur, kontrahentów, podatków/ČSSZ/VZP i DPH/VIES.
-
-## Lokalnie
-```bash
+## Render — Build Command
 pip install -r requirements.txt
-python app.py
-```
 
-## Zmienne środowiskowe dla wersji online
-- APP_PASSWORD - hasło do logowania
-- SECRET_KEY - długi losowy sekret Flask
-- APP_CLOUD_MODE=1
-- INVOICE_APP_DATA=/var/data
-- INVOICE_PDF_DIR=/var/data/invoices
+## Render — Start Command
+gunicorn app:app --workers 1 --threads 4 --timeout 120
 
-## Render
-Build command:
-`pip install -r requirements.txt`
+## Render — Environment Variables
+APP_CLOUD_MODE=1
+APP_PASSWORD=<twoje mocne hasło>
+SECRET_KEY=<długi losowy sekret>
+SUPABASE_URL=https://TWOJ_PROJECT.supabase.co
+SUPABASE_SERVICE_KEY=<secret/service-role key>
+SUPABASE_BUCKET=faktury-osvc
 
-Start command:
-`gunicorn app:app --workers 1 --threads 4 --timeout 120`
+Nie ustawiaj INVOICE_APP_DATA=/var/data — w darmowej wersji nie używamy dysku Render.
 
-Dla SQLite koniecznie użyj jednego workera oraz persistent disk zamontowanego pod `/var/data`.
+## Supabase
+1. Utwórz darmowy projekt.
+2. Storage -> New bucket.
+3. Nazwa: faktury-osvc.
+4. Bucket ma pozostać PRIVATE.
+5. W Settings/API skopiuj Project URL i server-side secret/service-role key.
+6. Nigdy nie wrzucaj tego klucza do GitHub.
 
+Aplikacja:
+- pobiera SQLite z Supabase przy starcie,
+- po zmianie danych wysyła nowy snapshot,
+- przechowuje 7 rotacyjnych kopii bezpieczeństwa w folderze backups.
 
-## V7.1
-Poprawka uruchamiania automatycznych kopii bazy (backup jest wywoływany po zdefiniowaniu funkcji).
+## Ważne
+Render Free usypia aplikację po bezczynności. Pierwsze wejście po uśpieniu może trwać około minuty.
+Supabase Free może wstrzymać projekt po dłuższej bezczynności; można go wznowić z panelu Supabase.

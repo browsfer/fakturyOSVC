@@ -36,10 +36,18 @@ _ensure_dependencies()
 import os
 import secrets
 
-# V7: tryb web/PWA.
+# V7.2 FREE: tryb web/PWA bez płatnego persistent disk.
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 SECRET_KEY = os.environ.get("SECRET_KEY", "").strip() or secrets.token_hex(32)
 CLOUD_MODE = bool(os.environ.get("RENDER") or os.environ.get("APP_CLOUD_MODE"))
+
+# Trwałość danych w darmowym wariancie:
+# Render Free = aplikacja, Supabase Storage Free = prywatna kopia pliku SQLite.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "faktury-osvc").strip() or "faktury-osvc"
+SUPABASE_DB_OBJECT = os.environ.get("SUPABASE_DB_OBJECT", "data/invoice_app.db").strip() or "data/invoice_app.db"
+REMOTE_DB_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
 
 import shutil
 import tempfile
@@ -49,6 +57,9 @@ import threading
 import unicodedata
 import webbrowser
 import hmac
+import urllib.request
+import urllib.error
+import urllib.parse
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_CEILING
 from io import BytesIO, StringIO
@@ -813,6 +824,10 @@ EMBEDDED_TEMPLATES = {'404.html': '{% extends "base.html" %}\n'
                'RESET</span><input name="confirmation" placeholder="RESET" required></label><div '
                'class="form-actions"><button class="btn btn-danger" type="submit">Usuń faktury i zresetuj '
                'numerację</button></div></form></section>\n'
+               '<section class="panel"><h2>Chmura / trwałość danych</h2>'
+               '<p>{% if remote_db_enabled %}<strong>Aktywna:</strong> baza jest synchronizowana z prywatnym Supabase Storage po każdej zmianie.'
+               '<br><span class="muted">Bucket: {{ remote_bucket }}</span>{% else %}<strong>Nieaktywna.</strong> W wersji lokalnej dane są tylko na tym komputerze.{% endif %}</p>'
+               '</section>'
                '<section class="panel"><h2>Gdzie są dane?</h2><p class="muted preline">{{ db_path }}</p><p '
                'class="small muted">Sam program jest jednym plikiem, natomiast baza musi pozostać osobno, aby dane '
                'przetrwały aktualizacje.</p></section>\n'
@@ -1297,6 +1312,8 @@ APP_DIR = Path(__file__).resolve().parent
 
 
 def _default_data_dir() -> Path:
+    if CLOUD_MODE:
+        return Path("/tmp") / "FakturyOSVC"
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
         return base / "FakturyOSVC"
@@ -1318,6 +1335,144 @@ DEFAULT_PDF_DIR = (DATA_DIR / "invoices") if CLOUD_MODE else (Path.home() / "Doc
 INVOICE_PDF_DIR = Path(os.environ.get("INVOICE_PDF_DIR", str(DEFAULT_PDF_DIR)))
 INVOICE_PDF_DIR.mkdir(parents=True, exist_ok=True)
 
+
+
+_REMOTE_SYNC_LOCK = threading.RLock()
+
+
+def _supabase_object_url(object_path: str, authenticated: bool = False) -> str:
+    safe_bucket = urllib.parse.quote(SUPABASE_BUCKET, safe="")
+    safe_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
+    if authenticated:
+        return f"{SUPABASE_URL}/storage/v1/object/authenticated/{safe_bucket}/{safe_path}"
+    return f"{SUPABASE_URL}/storage/v1/object/{safe_bucket}/{safe_path}"
+
+
+def _supabase_headers(content_type: str | None = None) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def download_remote_database() -> bool:
+    """Pobiera najnowszą bazę z prywatnego Supabase Storage przy starcie."""
+    if not REMOTE_DB_ENABLED:
+        return False
+    with _REMOTE_SYNC_LOCK:
+        req = urllib.request.Request(
+            _supabase_object_url(SUPABASE_DB_OBJECT, authenticated=True),
+            headers=_supabase_headers(),
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                print("Supabase: brak zdalnej bazy — przy pierwszym uruchomieniu zostanie utworzona nowa.")
+                return False
+            print(f"Supabase: nie udało się pobrać bazy (HTTP {exc.code}).")
+            return False
+        except Exception as exc:
+            print(f"Supabase: nie udało się pobrać bazy: {exc}")
+            return False
+
+        if not data:
+            return False
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = DB_PATH.with_suffix(".download")
+        temp_path.write_bytes(data)
+        # Szybka kontrola, czy to rzeczywiście poprawna baza SQLite.
+        try:
+            check = sqlite3.connect(temp_path)
+            check.execute("PRAGMA schema_version").fetchone()
+            check.close()
+        except Exception as exc:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            print(f"Supabase: pobrany plik nie jest poprawną bazą SQLite: {exc}")
+            return False
+        os.replace(temp_path, DB_PATH)
+        print(f"Supabase: pobrano bazę ({len(data)} bajtów).")
+        return True
+
+
+def _sqlite_snapshot_file() -> Path:
+    """Tworzy spójny snapshot otwartej/aktywnej bazy SQLite."""
+    fd, temp_name = tempfile.mkstemp(prefix="faktury_cloud_", suffix=".sqlite3")
+    os.close(fd)
+    target = Path(temp_name)
+    source = sqlite3.connect(DB_PATH)
+    destination = sqlite3.connect(target)
+    try:
+        with destination:
+            source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    return target
+
+
+def upload_file_to_supabase(local_path: Path, object_path: str) -> bool:
+    if not REMOTE_DB_ENABLED or not local_path.exists():
+        return False
+    with _REMOTE_SYNC_LOCK:
+        data = local_path.read_bytes()
+        req = urllib.request.Request(
+            _supabase_object_url(object_path, authenticated=False),
+            data=data,
+            headers={
+                **_supabase_headers("application/octet-stream"),
+                "x-upsert": "true",
+                "cache-control": "no-cache",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as response:
+                response.read()
+            return True
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
+            print(f"Supabase: upload nieudany HTTP {exc.code}: {body}")
+            return False
+        except Exception as exc:
+            print(f"Supabase: upload nieudany: {exc}")
+            return False
+
+
+def upload_remote_database() -> bool:
+    """Wysyła spójny snapshot bazy po każdej zmianie."""
+    if not REMOTE_DB_ENABLED or not DB_PATH.exists():
+        return False
+    snapshot = None
+    try:
+        snapshot = _sqlite_snapshot_file()
+        ok = upload_file_to_supabase(snapshot, SUPABASE_DB_OBJECT)
+        if ok:
+            print("Supabase: baza zsynchronizowana.")
+        return ok
+    finally:
+        if snapshot is not None:
+            try:
+                snapshot.unlink()
+            except OSError:
+                pass
+
+
+# Na darmowym Renderze lokalny dysk znika po uśpieniu/restarcie.
+# Dlatego pobieramy bazę zanim uruchomimy migracje i init_db().
+REMOTE_DB_DOWNLOADED = download_remote_database()
 
 def _migrate_legacy_database() -> str | None:
     """Kopiuje bazę ze starej wieloplikowej wersji przy pierwszym uruchomieniu."""
@@ -1350,7 +1505,7 @@ app = Flask(__name__, static_folder=None)
 app.secret_key = SECRET_KEY
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=CLOUD_MODE)
 app.jinja_loader = DictLoader(EMBEDDED_TEMPLATES)
-app.secret_key = os.environ.get("INVOICE_APP_SECRET", "local-invoice-app-change-me")
+app.secret_key = SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 
@@ -1812,6 +1967,8 @@ def init_tax_module() -> None:
 with app.app_context():
     init_db()
     init_tax_module()
+    if REMOTE_DB_ENABLED:
+        upload_remote_database()
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -2272,6 +2429,35 @@ def inject_globals() -> dict[str, Any]:
 @app.context_processor
 def inject_v7_globals() -> dict[str, Any]:
     return {"auth_enabled": bool(APP_PASSWORD), "cloud_mode": CLOUD_MODE}
+
+
+
+@app.before_request
+def v72_track_database_state():
+    try:
+        g.db_mtime_before = DB_PATH.stat().st_mtime_ns if DB_PATH.exists() else 0
+        g.db_size_before = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    except OSError:
+        g.db_mtime_before = 0
+        g.db_size_before = 0
+
+
+@app.after_request
+def v72_sync_database_after_change(response):
+    if not REMOTE_DB_ENABLED or response.status_code >= 500:
+        return response
+    try:
+        current_mtime = DB_PATH.stat().st_mtime_ns if DB_PATH.exists() else 0
+        current_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        changed = (
+            current_mtime != getattr(g, "db_mtime_before", current_mtime)
+            or current_size != getattr(g, "db_size_before", current_size)
+        )
+        if changed:
+            upload_remote_database()
+    except Exception as exc:
+        print(f"Supabase: błąd automatycznej synchronizacji: {exc}")
+    return response
 
 
 @app.before_request
@@ -3836,6 +4022,10 @@ def ensure_daily_backup() -> None:
                 old.unlink()
             except OSError:
                 pass
+        if REMOTE_DB_ENABLED:
+            # 7 rotacyjnych slotów w chmurze, bez rosnącego zużycia miejsca.
+            slot = date.today().weekday()
+            upload_file_to_supabase(target, f"backups/slot_{slot}.sqlite3")
     except Exception as exc:
         print("Automatyczny backup nie powiódł się:", exc)
 
@@ -3880,7 +4070,15 @@ def tools_page() -> str:
               "expenses": db.execute("SELECT COUNT(*) AS c FROM expenses").fetchone()["c"]}
     sequences = db.execute("SELECT year,next_number FROM invoice_sequences ORDER BY year").fetchall()
     next_numbers = ", ".join(f"{row['year']}: {row['next_number']}" for row in sequences) or "1"
-    return render_template("tools.html", counts=counts, next_numbers=next_numbers, db_path=str(DB_PATH), invoices_path=str(INVOICE_PDF_DIR))
+    return render_template(
+        "tools.html",
+        counts=counts,
+        next_numbers=next_numbers,
+        db_path=str(DB_PATH),
+        invoices_path=str(INVOICE_PDF_DIR),
+        remote_db_enabled=REMOTE_DB_ENABLED,
+        remote_bucket=SUPABASE_BUCKET,
+    )
 
 
 @app.post("/tools/reset-invoices")
@@ -3974,7 +4172,7 @@ if __name__ == "__main__":
     if MIGRATED_FROM:
         print(f"Zaimportowano dane ze starej aplikacji: {MIGRATED_FROM}")
         print(f"Nowa baza danych: {DB_PATH}")
-    print("Faktury OSVČ V7 Web/PWA")
+    print("Faktury OSVČ V7.2 FREE Web/PWA")
     print(f"Baza danych: {DB_PATH}")
     print(f"Faktury PDF: {INVOICE_PDF_DIR}")
     port = int(os.environ.get("PORT", "5000"))
@@ -3982,4 +4180,6 @@ if __name__ == "__main__":
         threading.Timer(1.2, open_browser).start()
     elif not APP_PASSWORD:
         print("UWAGA: APP_PASSWORD nie jest ustawione - aplikacja online nie ma ochrony hasłem!")
+    if CLOUD_MODE and not REMOTE_DB_ENABLED:
+        print("UWAGA: SUPABASE_URL/SUPABASE_SERVICE_KEY nie są ustawione. Dane na darmowym Renderze NIE będą trwałe!")
     app.run(host="0.0.0.0" if CLOUD_MODE else "127.0.0.1", port=port, debug=False, use_reloader=False)
