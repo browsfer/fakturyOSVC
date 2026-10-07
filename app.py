@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Jednoplikowa aplikacja V5: faktury, podatki/składki (w tym zmiana vedlejší → hlavní) i DPH/VIES. Przy pierwszym uruchomieniu automatycznie doinstaluje
+# Jednoplikowa aplikacja V8: faktury, podatki/składki (w tym zmiana vedlejší → hlavní) i DPH/VIES. Przy pierwszym uruchomieniu automatycznie doinstaluje
 # Flask i ReportLab, jeżeli nie są jeszcze dostępne w tym Pythonie.
 import importlib.util
 import subprocess
@@ -36,7 +36,7 @@ _ensure_dependencies()
 import os
 import secrets
 
-# V7.2 FREE: tryb web/PWA bez płatnego persistent disk.
+# V8: web/PWA z modułem Prop firmy i darmową synchronizacją Supabase.
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 SECRET_KEY = os.environ.get("SECRET_KEY", "").strip() or secrets.token_hex(32)
 CLOUD_MODE = bool(os.environ.get("RENDER") or os.environ.get("APP_CLOUD_MODE"))
@@ -1314,6 +1314,374 @@ document.addEventListener('DOMContentLoaded', function(){
 """
 
 
+# ---------------------------------------------------------------------------
+# V8: ewidencja prop firm, payoutów oraz wspólny kalkulator OSVČ
+# ---------------------------------------------------------------------------
+
+# Dodaj zakładkę do menu bez naruszania pozostałych pozycji.
+_prop_nav_anchor = '<a href="{{ url_for(\'projects_list\') }}">Projekty</a>'
+if _prop_nav_anchor in EMBEDDED_TEMPLATES["base.html"] and "prop_firms_dashboard" not in EMBEDDED_TEMPLATES["base.html"]:
+    EMBEDDED_TEMPLATES["base.html"] = EMBEDDED_TEMPLATES["base.html"].replace(
+        _prop_nav_anchor,
+        _prop_nav_anchor + '\n            <a href="{{ url_for(\'prop_firms_dashboard\') }}">Prop firmy</a>',
+        1,
+    )
+
+EMBEDDED_TEMPLATES["prop_firms.html"] = r"""{% extends "base.html" %}
+{% block title %}Prop firmy - Faktury OSVČ{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Prop firmy</h1>
+    <p class="muted">Ewidencja rzeczywiście otrzymanych payoutów. Wirtualny wynik rachunku nie jest tu przychodem.</p>
+  </div>
+  <div class="button-row">
+    <a class="btn btn-light" href="{{ url_for('prop_firm_new') }}">+ Dodaj firmę</a>
+    <a class="btn btn-primary" href="{{ url_for('prop_payout_new') }}">+ Dodaj payout</a>
+  </div>
+</div>
+
+<div class="callout info">
+  <strong>Zasada ewidencji:</strong> przychód to kwota należna Tobie po profit split, ale przed opłatą operatora,
+  przeliczona na CZK w dniu, w którym środki stały się dostępne. Późniejszy przelew na własny bank lub portfel nie tworzy drugiego przychodu.
+  Klasyfikacja PIT nie ustala automatycznie DPH – DPH jest przechowywane osobno jako status do sprawdzenia.
+</div>
+
+<div class="callout warning">
+  <strong>LucidFlex:</strong> domyślny profil dotyczy wyłącznie konta symulowanego objętego umową
+  Lucid Trading Group LLC z 28.11.2025. Przy podziale 90/10 wynik symulowany 1 000 USD oznacza
+  payout/przychód 900 USD przed opłatą operatora. Konto live wymaga dodania oddzielnej pozycji
+  i ponownej analizy nowej umowy.
+</div>
+
+<form class="toolbar" method="get">
+  <input type="number" name="year" min="2020" max="2100" value="{{ selected_year }}">
+  <select name="firm_id">
+    <option value="">Wszystkie firmy</option>
+    {% for firm in firms %}<option value="{{ firm.id }}" {% if selected_firm_id == firm.id %}selected{% endif %}>{{ firm.name }}</option>{% endfor %}
+  </select>
+  <button class="btn btn-light" type="submit">Filtruj</button>
+  {% if selected_firm_id %}<a class="btn btn-ghost" href="{{ url_for('prop_firms_dashboard', year=selected_year) }}">Wyczyść firmę</a>{% endif %}
+</form>
+
+<div class="stats-grid dashboard-stats">
+  <div class="stat-card"><span class="stat-value compact-value">{{ summary.gross_czk|money('CZK') }}</span><span class="stat-label">Przychód brutto do PIT</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ summary.fee_czk|money('CZK') }}</span><span class="stat-label">Opłaty operatorów – informacyjnie</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ summary.net_czk|money('CZK') }}</span><span class="stat-label">Otrzymano netto</span></div>
+  <div class="stat-card"><span class="stat-value">{{ summary.count }}</span><span class="stat-label">Liczba payoutów</span></div>
+</div>
+
+<section class="panel">
+  <div class="panel-header"><h2>Payouty {{ selected_year }}</h2></div>
+  {% if payouts %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Data</th><th>Firma / identyfikator</th><th>Należne po split</th><th>Opłata</th><th>Netto</th><th>Przychód CZK</th><th>Kwalifikacja</th><th>Faktura</th><th></th></tr></thead>
+    <tbody>
+    {% for p in payouts %}
+      <tr>
+        <td>{{ p.received_date|date_pl }}</td>
+        <td><strong>{{ p.firm_name }}</strong><br><span class="muted">{{ p.payout_identifier or '—' }}</span></td>
+        <td>{{ p.gross_amount|money(p.currency) }}</td>
+        <td>{{ p.operator_fee|money(p.currency) }}</td>
+        <td>{{ p.net_amount|money(p.currency) }}</td>
+        <td><strong>{{ p.income_czk|money('CZK') }}</strong><br><span class="muted">kurs {{ p.czk_rate }}</span></td>
+        <td>
+          <span class="badge {% if p.qualification_status == 'unconfirmed' %}badge-warning{% elif p.qualification_status == 'confirmed' %}badge-paid{% endif %}">{{ PROP_TAX_CLASSIFICATIONS[p.tax_classification] }}</span>
+          <br><small>{{ PROP_QUALIFICATION_STATUSES[p.qualification_status] }}</small>
+          <br><small class="muted">DPH: {{ PROP_DPH_TREATMENTS[p.dph_treatment] }}</small>
+        </td>
+        <td>{% if p.invoice_number %}<a href="{{ url_for('invoice_view', invoice_id=p.linked_invoice_id) }}">{{ p.invoice_number }}</a>{% else %}—{% endif %}</td>
+        <td class="actions"><a class="btn btn-light btn-small" href="{{ url_for('prop_payout_edit', payout_id=p.id) }}">Edytuj</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<div class="empty-state"><h3>Brak payoutów w wybranym okresie</h3><a class="btn btn-primary" href="{{ url_for('prop_payout_new') }}">Dodaj payout</a></div>{% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><h2>Konfiguracja prop firm</h2><a class="btn btn-light btn-small" href="{{ url_for('prop_firm_new') }}">Dodaj firmę</a></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Firma</th><th>Domyślna kwalifikacja PIT</th><th>Status oceny</th><th>Kontrahent/faktury</th><th>DPH</th><th></th></tr></thead>
+    <tbody>
+    {% for firm in firms_all %}
+      <tr>
+        <td><strong>{{ firm.name }}</strong>{% if not firm.active %}<br><span class="badge">Nieaktywna</span>{% endif %}
+          {% if firm.notes %}<details class="prop-assumption"><summary>Podstawa oceny</summary><div>{{ firm.notes }}</div></details>{% endif %}
+        </td>
+        <td>{{ PROP_TAX_CLASSIFICATIONS[firm.default_tax_classification] }}</td>
+        <td><span class="badge {% if firm.qualification_status == 'unconfirmed' %}badge-warning{% elif firm.qualification_status == 'confirmed' %}badge-paid{% endif %}">{{ PROP_QUALIFICATION_STATUSES[firm.qualification_status] }}</span></td>
+        <td>{{ firm.contractor_name or 'Nie przypisano' }}</td>
+        <td>{{ PROP_DPH_TREATMENTS[firm.dph_treatment] }}</td>
+        <td class="actions"><a class="btn btn-light btn-small" href="{{ url_for('prop_firm_edit', firm_id=firm.id) }}">Edytuj</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}
+"""
+
+EMBEDDED_TEMPLATES["prop_firm_form.html"] = r"""{% extends "base.html" %}
+{% block title %}{{ 'Edytuj prop firmę' if is_edit else 'Nowa prop firma' }} - Faktury OSVČ{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>{{ 'Edytuj prop firmę' if is_edit else 'Nowa prop firma' }}</h1><p class="muted">Ustawienia są domyślne dla nowych payoutów. Istniejące payouty zachowują własną kwalifikację.</p></div></div>
+<form method="post" class="panel form-panel">
+<div class="form-grid two">
+  <label class="field span-2"><span>Nazwa firmy *</span><input name="name" value="{{ firm.name }}" required autofocus></label>
+  <label class="field"><span>Powiązany kontrahent fakturowy</span><select name="contractor_id"><option value="">— bez przypisania —</option>{% for c in contractors %}<option value="{{ c.id }}" {% if firm.contractor_id|string == c.id|string %}selected{% endif %}>{{ c.name }}</option>{% endfor %}</select><small>Ułatwia wybór faktury przy dodawaniu payoutu.</small></label>
+  <label class="field"><span>Domyślna kwalifikacja PIT</span><select name="default_tax_classification">{% for code,label in PROP_TAX_CLASSIFICATIONS.items() %}<option value="{{ code }}" {% if firm.default_tax_classification == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label class="field"><span>Status kwalifikacji</span><select name="qualification_status">{% for code,label in PROP_QUALIFICATION_STATUSES.items() %}<option value="{{ code }}" {% if firm.qualification_status == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label class="field"><span>Klasyfikacja DPH</span><select name="dph_treatment">{% for code,label in PROP_DPH_TREATMENTS.items() %}<option value="{{ code }}" {% if firm.dph_treatment == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select><small>Nie wpływa automatycznie na raport DPH/VIES.</small></label>
+  <label class="field span-2"><span>Notatka / podstawa oceny</span><textarea name="notes" rows="4">{{ firm.notes }}</textarea></label>
+  <label class="checkbox-row span-2"><input type="checkbox" name="active" value="1" {% if firm.active %}checked{% endif %}> <span>Firma aktywna</span></label>
+</div>
+<div class="form-actions"><button class="btn btn-primary" type="submit">Zapisz</button><a class="btn btn-ghost" href="{{ url_for('prop_firms_dashboard') }}">Anuluj</a></div>
+</form>
+{% if is_edit %}<div class="danger-zone"><span>Usunięcie jest możliwe tylko, jeśli firma nie ma payoutów.</span><form method="post" action="{{ url_for('prop_firm_delete', firm_id=firm.id) }}" onsubmit="return confirm('Usunąć tę prop firmę?')"><button class="btn btn-danger" type="submit">Usuń firmę</button></form></div>{% endif %}
+{% endblock %}
+"""
+
+EMBEDDED_TEMPLATES["prop_payout_form.html"] = r"""{% extends "base.html" %}
+{% block title %}{{ 'Edytuj payout' if is_edit else 'Nowy payout' }} - Faktury OSVČ{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>{{ 'Edytuj payout' if is_edit else 'Nowy payout' }}</h1><p class="muted">Wpisuj kwotę należną Tobie po profit split, przed opłatą operatora.</p></div></div>
+<form method="post" class="panel form-panel" id="prop-payout-form" data-is-edit="{{ 1 if is_edit else 0 }}">
+<div class="form-grid three">
+  <label class="field"><span>Firma *</span><select name="prop_firm_id" id="prop-firm-select" required>{% for f in firms %}<option value="{{ f.id }}" data-contractor="{{ f.contractor_id or '' }}" data-tax="{{ f.default_tax_classification }}" data-status="{{ f.qualification_status }}" data-dph="{{ f.dph_treatment }}" data-name="{{ f.name|e }}" data-notes="{{ f.notes|e }}" {% if payout.prop_firm_id|string == f.id|string %}selected{% endif %}>{{ f.name }}</option>{% endfor %}</select></label>
+  <label class="field"><span>Konto / identyfikator payoutu</span><input name="payout_identifier" value="{{ payout.payout_identifier }}" placeholder="np. account ID / payout #"></label>
+  <label class="field"><span>Data otrzymania dostępnych środków *</span><input type="date" name="received_date" value="{{ payout.received_date }}" required><small>Data na Rise/WorkMarket/wallecie, nie późniejszy przelew na własny bank.</small></label>
+  <div id="prop-firm-profile-note" class="callout info span-3" hidden></div>
+
+  <label class="field"><span>Waluta *</span><input id="payout-currency" name="currency" value="{{ payout.currency }}" maxlength="8" required placeholder="USD, EUR, USDT"></label>
+  <label class="field"><span>Kwota należna po profit split *</span><input id="payout-gross" type="number" step="0.00000001" min="0" name="gross_amount" value="{{ payout.gross_amount }}" required><small>Nie wpisuj wirtualnego wyniku rachunku. LucidFlex: 1 000 USD wyniku przy 90/10 → wpisz 900 USD.</small></label>
+  <label class="field"><span>Opłata operatora</span><input id="payout-fee" type="number" step="0.00000001" min="0" name="operator_fee" value="{{ payout.operator_fee }}"></label>
+
+  <label class="field"><span>Kwota otrzymana netto *</span><input id="payout-net" type="number" step="0.00000001" min="0" name="net_amount" value="{{ payout.net_amount }}" required><small>Informacyjnie; nie pomniejsza przychodu przy kosztach procentowych.</small></label>
+  <label class="field"><span>Kurs 1 jednostki waluty do CZK *</span><input id="payout-rate" type="number" step="0.000001" min="0.000001" name="czk_rate" value="{{ payout.czk_rate }}" required></label>
+  <label class="field"><span>Przychód w CZK</span><input id="payout-income-czk" value="{{ payout.income_czk }}" readonly><small>Kwota po split × kurs; przed opłatą operatora.</small></label>
+
+  <label class="field span-2"><span>Powiązana faktura</span><select name="linked_invoice_id" id="prop-invoice-select"><option value="">— bez faktury —</option>{% for inv in invoices %}<option value="{{ inv.id }}" data-contractor="{{ inv.contractor_id }}" {% if payout.linked_invoice_id|string == inv.id|string %}selected{% endif %}>{{ inv.invoice_number }} — {{ inv.contractor_name }} — {{ inv.total|money(inv.currency) }} — {{ inv.supply_date|date_pl }}</option>{% endfor %}</select><small>Powiązana faktura i payout są jednym przychodem. Faktura nie zostanie doliczona drugi raz.</small></label>
+  <div class="field"><span>&nbsp;</span><a class="btn btn-light" href="{{ url_for('invoice_new') }}">Wystaw nową fakturę</a></div>
+
+  <label class="field"><span>Kwalifikacja PIT</span><select name="tax_classification" id="prop-tax-classification">{% for code,label in PROP_TAX_CLASSIFICATIONS.items() %}<option value="{{ code }}" {% if payout.tax_classification == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label class="field"><span>Status kwalifikacji</span><select name="qualification_status" id="prop-qualification-status">{% for code,label in PROP_QUALIFICATION_STATUSES.items() %}<option value="{{ code }}" {% if payout.qualification_status == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label class="field"><span>DPH – osobna kwalifikacja</span><select name="dph_treatment" id="prop-dph-treatment">{% for code,label in PROP_DPH_TREATMENTS.items() %}<option value="{{ code }}" {% if payout.dph_treatment == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label class="field span-3"><span>Notatka</span><textarea name="notes" rows="4">{{ payout.notes }}</textarea></label>
+</div>
+<div class="callout warning"><strong>Ważne:</strong> opłata operatora, challenge fee oraz składki ČSSZ/VZP nie są dodatkowo odejmowane, gdy dla tej grupy stosujesz koszty procentowe. Dla konta live nie używaj automatycznie profilu LucidFlex – najpierw przeanalizuj nową umowę i ustaw rozliczenie ręczne lub oddzielną firmę.</div>
+<div class="form-actions"><button class="btn btn-primary" type="submit">Zapisz payout</button><a class="btn btn-ghost" href="{{ url_for('prop_firms_dashboard') }}">Anuluj</a></div>
+</form>
+{% if is_edit %}<div class="danger-zone"><span></span><form method="post" action="{{ url_for('prop_payout_delete', payout_id=payout.id) }}" onsubmit="return confirm('Usunąć ten payout?')"><button class="btn btn-danger" type="submit">Usuń payout</button></form></div>{% endif %}
+{% endblock %}
+"""
+
+EMBEDDED_TEMPLATES["taxes_dashboard.html"] = r"""{% extends "base.html" %}
+{% block title %}Podatki i składki - Faktury OSVČ{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div><h1>Podatki i składki</h1><p class="muted">Rzeczywiście otrzymane przychody, procentowe koszty, podatek, ČSSZ i VZP.</p></div>
+  <div class="button-row"><form class="toolbar year-toolbar" method="get"><input type="number" name="year" min="2020" max="2100" value="{{ snapshot.year }}"><button class="btn btn-light" type="submit">Pokaż rok</button></form><a class="btn btn-light" href="{{ url_for('settings_page', year=snapshot.year) }}">Ustawienia obliczeń</a></div>
+</div>
+
+<div class="callout warning"><strong>Wyliczenie orientacyjne.</strong> Kwalifikacja prop firm jest konfigurowalną oceną dokumentów, a nie wiążącą interpretacją urzędu. DPH jest analizowane osobno.</div>
+{% if snapshot.assumptions %}<div class="callout info"><strong>Założenia użyte w kalkulacji:</strong><ul class="compact-list">{% for item in snapshot.assumptions %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+{% if snapshot.warnings %}<div class="callout warning"><strong>Sprawdź:</strong><ul class="compact-list">{% for warning in snapshot.warnings %}<li>{{ warning }}</li>{% endfor %}</ul></div>{% endif %}
+
+<div class="stats-grid dashboard-stats tax-stats">
+  <div class="stat-card"><span class="stat-value compact-value">{{ snapshot.welding_revenue|money('CZK') }}</span><span class="stat-label">Faktury usługowe / spawanie</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ snapshot.prop_revenue|money('CZK') }}</span><span class="stat-label">Prop firmy – przychód brutto</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ snapshot.revenue|money('CZK') }}</span><span class="stat-label">Łączny przychód §7</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ snapshot.flat_expenses|money('CZK') }}</span><span class="stat-label">Koszty procentowe razem</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ snapshot.profit|money('CZK') }}</span><span class="stat-label">Dochód podatkowy OSVČ</span></div>
+  <div class="stat-card {% if snapshot.income_tax_overpayment > 0 %}tax-good{% elif snapshot.income_tax_underpayment > 0 %}tax-warning{% endif %}"><span class="stat-value compact-value">{{ (snapshot.income_tax_overpayment if snapshot.income_tax_overpayment > 0 else snapshot.income_tax_underpayment)|money('CZK') }}</span><span class="stat-label">{% if snapshot.income_tax_overpayment > 0 %}Nadpłata podatku{% elif snapshot.income_tax_underpayment > 0 %}Podatek do dopłaty{% else %}Podatek: bilans 0{% endif %}</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ snapshot.remaining.cssz|money('CZK') }}</span><span class="stat-label">ČSSZ do dopłaty / rezerwy</span></div>
+  <div class="stat-card"><span class="stat-value compact-value">{{ snapshot.remaining.vzp|money('CZK') }}</span><span class="stat-label">VZP do dopłaty / rezerwy</span></div>
+  <div class="stat-card emphasis"><span class="stat-value compact-value">{{ snapshot.remaining_total|money('CZK') }}</span><span class="stat-label">Pozostała rezerwa po wpłatach</span></div>
+</div>
+
+<section class="panel">
+  <div class="panel-header"><h2>Wspólne koszty procentowe {{ snapshot.year }}</h2></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Grupa</th><th>Przychód</th><th>Stawka</th><th>Limit roczny</th><th>Wykorzystane koszty</th><th>Dochód</th></tr></thead>
+    <tbody>
+      <tr><td><strong>60% – spawanie + payouty zakwalifikowane do 60%</strong></td><td>{{ snapshot.group60_revenue|money('CZK') }}</td><td>{{ snapshot.settings.expense_percent }}%</td><td>{{ snapshot.settings.expense_limit|money('CZK') }}</td><td><strong>{{ snapshot.flat_expenses_60|money('CZK') }}</strong><br><small>{{ snapshot.group60_limit_usage_percent }}% limitu</small></td><td>{{ snapshot.profit_60|money('CZK') }}</td></tr>
+      <tr><td><strong>40% – inne przychody §7</strong></td><td>{{ snapshot.group40_revenue|money('CZK') }}</td><td>{{ snapshot.settings.expense_40_percent }}%</td><td>{{ snapshot.settings.expense_40_limit|money('CZK') }}</td><td><strong>{{ snapshot.flat_expenses_40|money('CZK') }}</strong></td><td>{{ snapshot.profit_40|money('CZK') }}</td></tr>
+    </tbody>
+    <tfoot><tr><th>Razem</th><th>{{ snapshot.revenue|money('CZK') }}</th><th></th><th></th><th>{{ snapshot.flat_expenses|money('CZK') }}</th><th>{{ snapshot.profit|money('CZK') }}</th></tr></tfoot>
+  </table></div>
+  <div class="callout info">Limit 1 200 000 CZK jest jeden dla całej grupy 60% – nie osobno dla spawania i każdej prop firmy oraz bez proporcjonalnego skracania za niepełny rok.</div>
+</section>
+
+<section class="panel">
+  <div class="panel-header"><h2>Rozliczenie zobowiązań</h2><span class="badge badge-warning">{{ snapshot.active_months }} mies. działalności</span></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Rodzaj</th><th>Należność roczna</th><th>Zapłacono / pobrano</th><th>Bilans</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Podatek dochodowy</strong></td><td>{{ snapshot.annual_tax_after_credit|money('CZK') }}</td><td>{{ snapshot.income_tax_paid_total|money('CZK') }}<br><small>w tym Accenture {{ snapshot.employment_tax_withheld|money('CZK') }}</small></td><td>{% if snapshot.income_tax_overpayment > 0 %}<strong class="text-success">Nadpłata {{ snapshot.income_tax_overpayment|money('CZK') }}</strong>{% else %}<strong>Do dopłaty {{ snapshot.income_tax_underpayment|money('CZK') }}</strong>{% endif %}</td></tr>
+      <tr><td><strong>ČSSZ</strong></td><td>{{ snapshot.cssz|money('CZK') }}</td><td>{{ snapshot.paid.cssz|money('CZK') }}</td><td>{% if snapshot.overpayments.cssz > 0 %}<strong class="text-success">Nadpłata {{ snapshot.overpayments.cssz|money('CZK') }}</strong>{% else %}<strong>Do dopłaty {{ snapshot.remaining.cssz|money('CZK') }}</strong>{% endif %}</td></tr>
+      <tr><td><strong>VZP</strong></td><td>{{ snapshot.vzp|money('CZK') }}</td><td>{{ snapshot.paid.vzp|money('CZK') }}</td><td>{% if snapshot.overpayments.vzp > 0 %}<strong class="text-success">Nadpłata {{ snapshot.overpayments.vzp|money('CZK') }}</strong>{% else %}<strong>Do dopłaty {{ snapshot.remaining.vzp|money('CZK') }}</strong>{% endif %}</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="panel">
+  <div class="panel-header"><h2>Minimalne miesięczne zaliczki</h2></div>
+  <div class="minimum-grid"><div class="minimum-card"><span class="minimum-name">ČSSZ</span><strong>{{ snapshot.settings.cssz_monthly_advance|money('CZK') }}</strong><small>Za dany miesiąc do jego ostatniego dnia.</small></div><div class="minimum-card"><span class="minimum-name">VZP</span><strong>{{ snapshot.settings.vzp_monthly_advance|money('CZK') }}</strong><small>Za dany miesiąc do 8. dnia następnego miesiąca.</small></div></div>
+</section>
+
+{% if snapshot.forecast_total > 0 %}
+<section class="panel forecast-panel"><div class="panel-header"><h2>Prognoza – poza rzeczywistym rozliczeniem</h2><span class="badge">Nie wpływa na wynik</span></div><div class="stats-grid"><div class="stat-card"><span class="stat-value compact-value">{{ snapshot.forecast_welding_revenue|money('CZK') }}</span><span class="stat-label">Prognoza spawanie</span></div><div class="stat-card"><span class="stat-value compact-value">{{ snapshot.forecast_prop_revenue|money('CZK') }}</span><span class="stat-label">Prognoza prop firmy</span></div><div class="stat-card"><span class="stat-value compact-value">{{ snapshot.forecast_total|money('CZK') }}</span><span class="stat-label">Prognoza razem</span></div></div></section>
+{% endif %}
+
+<section class="panel">
+  <div class="panel-header"><h2>Faktury uwzględnione jako przychód usługowy</h2><span class="muted">{{ 'według zapłaty' if snapshot.settings.revenue_basis == 'paid' else 'według wystawienia' }}</span></div>
+  {% if snapshot.invoice_rows %}<div class="table-wrap"><table><thead><tr><th>Faktura</th><th>Kontrahent</th><th>Data przychodu</th><th>Kwota CZK</th></tr></thead><tbody>{% for row in snapshot.invoice_rows %}<tr><td><a href="{{ url_for('invoice_view', invoice_id=row.id) }}"><strong>{{ row.invoice_number }}</strong></a></td><td>{{ row.contractor_name }}</td><td>{{ row.recognized_date|date_pl }}</td><td>{{ row.value_czk|money('CZK') }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">Brak faktur spełniających wybraną podstawę przychodu. Faktury powiązane z payoutami są wyłączone, aby nie liczyć ich drugi raz.</p>{% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><h2>Payouty uwzględnione w przychodzie</h2><a class="btn btn-light btn-small" href="{{ url_for('prop_firms_dashboard', year=snapshot.year) }}">Otwórz ewidencję</a></div>
+  {% if snapshot.prop_rows_included %}<div class="table-wrap"><table><thead><tr><th>Data</th><th>Firma</th><th>Przychód CZK</th><th>Grupa</th><th>Faktura</th></tr></thead><tbody>{% for row in snapshot.prop_rows_included %}<tr><td>{{ row.received_date|date_pl }}</td><td>{{ row.firm_name }}</td><td>{{ row.income_czk|money('CZK') }}</td><td>{{ PROP_TAX_CLASSIFICATIONS[row.tax_classification] }}</td><td>{{ row.invoice_number or '—' }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">Brak payoutów ujętych w §7 w tym roku.</p>{% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><h2>Zapisane wpłaty do urzędów</h2></div>
+  <form method="post" action="{{ url_for('tax_payment_add') }}" class="form-grid four tax-payment-form"><input type="hidden" name="year" value="{{ snapshot.year }}"><label class="field"><span>Data wpłaty</span><input type="date" name="payment_date" value="{{ today }}" required></label><label class="field"><span>Rodzaj</span><select name="payment_type">{% for code,label in TAX_PAYMENT_TYPES.items() %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select></label><label class="field"><span>Kwota CZK</span><input type="number" step="0.01" min="0.01" name="amount" required></label><label class="field"><span>Notatka</span><input name="note"></label><div class="span-4 form-actions compact-actions"><button class="btn btn-primary" type="submit">Dodaj wpłatę</button></div></form>
+  {% if payments %}<div class="table-wrap"><table><thead><tr><th>Data</th><th>Rodzaj</th><th>Kwota</th><th>Notatka</th><th></th></tr></thead><tbody>{% for payment in payments %}<tr><td>{{ payment.payment_date|date_pl }}</td><td>{{ TAX_PAYMENT_TYPES[payment.payment_type] }}</td><td>{{ payment.amount|money('CZK') }}</td><td>{{ payment.note or '—' }}</td><td><form method="post" action="{{ url_for('tax_payment_delete', payment_id=payment.id) }}" onsubmit="return confirm('Usunąć tę wpłatę?')"><input type="hidden" name="year" value="{{ snapshot.year }}"><button class="btn btn-light btn-small">Usuń</button></form></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">Brak zapisanych wpłat.</p>{% endif %}
+</section>
+{% endblock %}
+"""
+
+EMBEDDED_TEMPLATES["settings.html"] = r"""{% extends "base.html" %}
+{% block title %}Ustawienia - Faktury OSVČ{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Ustawienia</h1><p class="muted">Parametry są przechowywane osobno dla każdego roku.</p></div><form class="toolbar year-toolbar" method="get"><input type="number" name="year" min="2020" max="2100" value="{{ snapshot.year }}"><button class="btn btn-light">Pokaż rok</button></form></div>
+<div class="callout info">Zmiany wpływają wyłącznie na kalkulacje aplikacji – nie wysyłają żadnych danych do urzędów.</div>
+<section class="panel"><form method="post" action="{{ url_for('tax_settings_save') }}" class="form-panel tax-settings-form"><input type="hidden" name="year" value="{{ snapshot.year }}">
+<h2>Przychód, koszty procentowe i podatek</h2>
+<div class="form-grid three">
+  <label class="field"><span>Początek działalności</span><input type="date" name="activity_start_date" value="{{ snapshot.settings.activity_start_date }}"></label>
+  <label class="field"><span>Koniec działalności</span><input type="date" name="activity_end_date" value="{{ snapshot.settings.activity_end_date }}"></label>
+  <label class="field"><span>Faktury usługowe licz</span><select name="revenue_basis"><option value="paid" {% if snapshot.settings.revenue_basis == 'paid' %}selected{% endif %}>Według zapłaty</option><option value="issued" {% if snapshot.settings.revenue_basis == 'issued' %}selected{% endif %}>Według wystawienia</option></select><small>Payouty zawsze według faktycznej daty otrzymania.</small></label>
+  <label class="field"><span>Grupa 60% – stawka kosztów</span><input type="number" step="0.01" min="0" max="100" name="expense_percent" value="{{ snapshot.settings.expense_percent }}"></label>
+  <label class="field"><span>Grupa 60% – wspólny limit kosztów CZK</span><input type="number" step="1" min="0" name="expense_limit" value="{{ snapshot.settings.expense_limit }}"><small>Wspólny dla spawania i payoutów 60%; nieproporcjonalny.</small></label>
+  <label class="field"><span>Grupa 40% – stawka kosztów</span><input type="number" step="0.01" min="0" max="100" name="expense_40_percent" value="{{ snapshot.settings.expense_40_percent }}"></label>
+  <label class="field"><span>Grupa 40% – limit kosztów CZK</span><input type="number" step="1" min="0" name="expense_40_limit" value="{{ snapshot.settings.expense_40_limit }}"></label>
+  <label class="field"><span>Roczna ulga podatnika</span><input type="number" step="1" min="0" name="income_tax_credit" value="{{ snapshot.settings.income_tax_credit }}"></label>
+  <label class="field"><span>Próg 23% w CZK</span><input type="number" step="1" min="0" name="tax_threshold" value="{{ snapshot.settings.tax_threshold }}"></label>
+  <label class="field"><span>Podstawa podatku z zatrudnienia</span><input type="number" step="1" min="0" name="employment_tax_base" value="{{ snapshot.settings.employment_tax_base }}"></label>
+  <label class="field"><span>Zaliczki pobrane przez pracodawcę</span><input type="number" step="1" min="0" name="employment_tax_withheld" value="{{ snapshot.settings.employment_tax_withheld }}"></label>
+</div>
+<hr><h2>Prognoza opcjonalna – nie wpływa na rozliczenie</h2>
+<div class="form-grid two"><label class="field"><span>Prognozowany przychód ze spawania CZK</span><input type="number" step="1" min="0" name="forecast_welding_revenue" value="{{ snapshot.settings.forecast_welding_revenue }}"></label><label class="field"><span>Prognozowany przychód z prop firm CZK</span><input type="number" step="1" min="0" name="forecast_prop_revenue" value="{{ snapshot.settings.forecast_prop_revenue }}"></label></div>
+<hr><h2>ČSSZ</h2>
+<div class="form-grid three">
+  <label class="field"><span>Tryb działalności</span><select name="cssz_mode"><option value="secondary" {% if snapshot.settings.cssz_mode == 'secondary' %}selected{% endif %}>Tylko vedlejší</option><option value="mixed" {% if snapshot.settings.cssz_mode == 'mixed' %}selected{% endif %}>Vedlejší → hlavní</option><option value="main" {% if snapshot.settings.cssz_mode == 'main' %}selected{% endif %}>Tylko hlavní</option><option value="custom" {% if snapshot.settings.cssz_mode == 'custom' %}selected{% endif %}>Własne ustawienia</option></select></label>
+  <label class="field"><span>Hlavní od dnia</span><input type="date" name="cssz_main_from_date" value="{{ snapshot.settings.cssz_main_from_date }}"></label>
+  <label class="field"><span>Rozhodná částka roczna</span><input type="number" step="1" name="cssz_threshold_annual" value="{{ snapshot.settings.cssz_threshold_annual }}"></label>
+  <label class="field"><span>Pomniejszenie progu za miesiąc</span><input type="number" step="1" name="cssz_threshold_reduction_month" value="{{ snapshot.settings.cssz_threshold_reduction_month }}"></label>
+  <label class="field"><span>Podstawa z dochodu (%)</span><input type="number" step="0.01" name="cssz_assessment_percent" value="{{ snapshot.settings.cssz_assessment_percent }}"></label>
+  <label class="field"><span>Stawka ČSSZ (%)</span><input type="number" step="0.01" name="cssz_rate_percent" value="{{ snapshot.settings.cssz_rate_percent }}"></label>
+  <label class="field"><span>Min. podstawa miesięczna hlavní</span><input type="number" step="0.01" name="cssz_min_monthly_base" value="{{ snapshot.settings.cssz_min_monthly_base }}"></label>
+  <label class="field"><span>Min. podstawa miesięczna vedlejší</span><input type="number" step="0.01" name="cssz_secondary_min_monthly_base" value="{{ snapshot.settings.cssz_secondary_min_monthly_base }}"></label>
+  <label class="field"><span>Bieżąca zaliczka miesięczna ČSSZ</span><input type="number" step="0.01" name="cssz_monthly_advance" value="{{ snapshot.settings.cssz_monthly_advance }}"></label>
+</div>
+<hr><h2>VZP</h2>
+<div class="form-grid three">
+  <label class="field"><span>Tryb ubezpieczenia</span><select name="vzp_mode"><option value="secondary" {% if snapshot.settings.vzp_mode == 'secondary' %}selected{% endif %}>Bez minimum / zatrudnienie</option><option value="mixed" {% if snapshot.settings.vzp_mode == 'mixed' %}selected{% endif %}>Zmiana na główną OSVČ</option><option value="main" {% if snapshot.settings.vzp_mode == 'main' %}selected{% endif %}>Główna OSVČ</option><option value="custom" {% if snapshot.settings.vzp_mode == 'custom' %}selected{% endif %}>Własne ustawienia</option></select></label>
+  <label class="field"><span>Minimum od dnia</span><input type="date" name="vzp_main_from_date" value="{{ snapshot.settings.vzp_main_from_date }}"></label>
+  <label class="field"><span>Podstawa z dochodu (%)</span><input type="number" step="0.01" name="vzp_assessment_percent" value="{{ snapshot.settings.vzp_assessment_percent }}"></label>
+  <label class="field"><span>Stawka VZP (%)</span><input type="number" step="0.01" name="vzp_rate_percent" value="{{ snapshot.settings.vzp_rate_percent }}"></label>
+  <label class="field"><span>Minimalna podstawa miesięczna</span><input type="number" step="0.01" name="vzp_min_monthly_base" value="{{ snapshot.settings.vzp_min_monthly_base }}"></label>
+  <label class="field"><span>Bieżąca zaliczka miesięczna VZP</span><input type="number" step="0.01" name="vzp_monthly_advance" value="{{ snapshot.settings.vzp_monthly_advance }}"></label>
+</div>
+<div class="form-actions"><button class="btn btn-primary" type="submit">Zapisz ustawienia</button><a class="btn btn-light" href="{{ url_for('taxes_dashboard', year=snapshot.year) }}">Wróć do wyników</a></div>
+</form></section>
+{% endblock %}
+"""
+
+# Informacja o powiązanym payoutcie na fakturze.
+_invoice_detail_v8 = EMBEDDED_TEMPLATES["invoice_detail.html"]
+_detail_anchor = '<div class="detail-grid">'
+if _detail_anchor in _invoice_detail_v8:
+    _invoice_detail_v8 = _invoice_detail_v8.replace(
+        _detail_anchor,
+        """{% if linked_payout %}<div class="callout info"><strong>Prop firma:</strong> faktura jest powiązana z payoutem {{ linked_payout.firm_name }} otrzymanym {{ linked_payout.received_date|date_pl }}. W kalkulatorze przychodu liczony jest payout {{ linked_payout.income_czk|money('CZK') }}, a faktura nie jest liczona drugi raz. <a href="{{ url_for('prop_payout_edit', payout_id=linked_payout.id) }}">Otwórz payout</a>.</div>{% endif %}""" + _detail_anchor,
+        1,
+    )
+EMBEDDED_TEMPLATES["invoice_detail.html"] = _invoice_detail_v8
+
+# Narzędzia: pokaż także dane prop firm.
+_tools_v8 = EMBEDDED_TEMPLATES["tools.html"]
+_tools_v8 = _tools_v8.replace('<span class="stat-label">Koszty</span>', '<span class="stat-label">Koszty</span>', 1)
+EMBEDDED_TEMPLATES["tools.html"] = _tools_v8
+
+EMBEDDED_CSS += r"""
+/* V8 Prop firmy */
+.forecast-panel{border-style:dashed}.badge-warning{background:#fff0dd;color:#995200}.prop-assumption{font-size:.9rem}.field small{line-height:1.35}.danger-zone{margin-top:18px;display:flex;justify-content:space-between;gap:12px;align-items:center}.text-success{color:#16843d}.text-warning{color:#a55a00}
+@media(max-width:900px){.danger-zone{align-items:stretch;flex-direction:column}.danger-zone form,.danger-zone button{width:100%}}
+"""
+
+EMBEDDED_JS += r"""
+document.addEventListener('DOMContentLoaded', function(){
+  const form=document.getElementById('prop-payout-form');
+  if(!form) return;
+  const firm=document.getElementById('prop-firm-select');
+  const gross=document.getElementById('payout-gross');
+  const fee=document.getElementById('payout-fee');
+  const net=document.getElementById('payout-net');
+  const rate=document.getElementById('payout-rate');
+  const currency=document.getElementById('payout-currency');
+  const income=document.getElementById('payout-income-czk');
+  const inv=document.getElementById('prop-invoice-select');
+  const tax=document.getElementById('prop-tax-classification');
+  const status=document.getElementById('prop-qualification-status');
+  const dph=document.getElementById('prop-dph-treatment');
+  const profileNote=document.getElementById('prop-firm-profile-note');
+  let netTouched=!!(net && net.value);
+  if(net) net.addEventListener('input',()=>{netTouched=true});
+  function n(el){const v=parseFloat(String(el&&el.value||'').replace(',','.'));return Number.isFinite(v)?v:0}
+  function recalc(){
+    if(currency && currency.value.trim().toUpperCase()==='CZK' && rate && (!rate.value || rate.value==='0')) rate.value='1';
+    if(net && !netTouched) net.value=Math.max(n(gross)-n(fee),0).toFixed(2);
+    if(income) income.value=(n(gross)*n(rate)).toFixed(2);
+  }
+  [gross,fee,rate,currency].forEach(el=>{if(el)el.addEventListener('input',recalc)});
+  function filterInvoices(){
+    if(!firm || !inv) return;
+    const opt=firm.options[firm.selectedIndex];
+    const cid=String((opt && opt.dataset.contractor)||'');
+    Array.from(inv.options).forEach((o,i)=>{
+      const selected=o.selected;
+      o.hidden=i>0 && !selected && !!cid && String(o.dataset.contractor||'')!==cid;
+    });
+  }
+  function showFirmProfile(){
+    if(!profileNote || !firm) return;
+    const opt=firm.options[firm.selectedIndex];
+    const notes=String((opt && opt.dataset.notes)||'').trim();
+    if(notes){
+      profileNote.textContent=notes;
+      profileNote.hidden=false;
+    }else{
+      profileNote.textContent='';
+      profileNote.hidden=true;
+    }
+  }
+  function applyFirmDefaults(){
+    if(!firm) return; const opt=firm.options[firm.selectedIndex]; if(!opt) return;
+    if(tax) tax.value=opt.dataset.tax||tax.value;
+    if(status) status.value=opt.dataset.status||status.value;
+    if(dph) dph.value=opt.dataset.dph||dph.value;
+    filterInvoices();
+    showFirmProfile();
+  }
+  if(firm) firm.addEventListener('change',applyFirmDefaults);
+  if(form.dataset.isEdit!=='1') applyFirmDefaults(); else { filterInvoices(); showFirmProfile(); }
+  recalc();
+});
+"""
+
 APP_DIR = Path(__file__).resolve().parent
 
 
@@ -1585,6 +1953,42 @@ TAX_PAYMENT_TYPES = {
     'cssz': 'ČSSZ',
     'vzp': 'VZP',
 }
+
+
+PROP_TAX_CLASSIFICATIONS = {
+    "s7_60": "§7 – działalność / koszty procentowe 60%",
+    "s7_40": "§7 – inna samostatná činnost / koszty 40%",
+    "exclude": "Nie uwzględniaj automatycznie – rozliczenie ręczne",
+}
+
+PROP_QUALIFICATION_STATUSES = {
+    "confirmed": "Potwierdzona",
+    "recommended": "Rekomendowana ocena dokumentów – niewiążąca",
+    "unconfirmed": "Kwalifikacja do potwierdzenia",
+}
+
+PROP_DPH_TREATMENTS = {
+    "review": "DPH do osobnej kwalifikacji",
+    "outside_eu": "Usługa dla kontrahenta spoza UE – bez SH VIES",
+    "eu_service": "Usługa B2B UE – możliwe SH VIES",
+    "not_required": "Nie ujmuj w DPH / SH VIES",
+}
+
+
+LUCIDFLEX_PROFILE_NAME = "LucidFlex"
+LUCIDFLEX_MIGRATION_KEY = "v8_1_lucidflex_agreement_2025_11_28"
+LUCID_LEGACY_DEFAULT_NOTE = (
+    "Kwalifikacja do potwierdzenia. Domyślnie przyjęto §7/60% wyłącznie jako konfigurowalne założenie kalkulatora."
+)
+LUCIDFLEX_PROFILE_NOTES = (
+    "Umowa Lucid Trading Group LLC z 28.11.2025 – LucidFlex, konto symulowane należące do podatnika. "
+    "Reward jest wynagrodzeniem za dane generowane podczas symulowanego tradingu (wstęp C i §11). "
+    "Rekomendowana, niewiążąca kwalifikacja: §7 OSVČ, koszty procentowe 60%, pod warunkiem wykonywania "
+    "usługi w ramach živnosti volné. Przychód stanowi payout należny po podziale 90/10, przed rzeczywistą "
+    "opłatą operatora; wirtualny wynik rachunku nie jest przychodem. Data przychodu to dzień otrzymania "
+    "lub udostępnienia środków u operatora, a późniejszy transfer na własny bank/portfel nie tworzy "
+    "drugiego przychodu. Konto live wymaga osobnej analizy nowej umowy."
+)
 
 MONTHS = {
     1: "Styczeń", 2: "Luty", 3: "Marzec", 4: "Kwiecień", 5: "Maj", 6: "Czerwiec",
@@ -1979,9 +2383,190 @@ def init_tax_module() -> None:
     db.commit()
 
 
+
+def migrate_lucidflex_profile(db: sqlite3.Connection) -> int:
+    """
+    Jednorazowo migruje wcześniejszy profil „Lucid Trading” do „LucidFlex”.
+    Zwraca id docelowej firmy. Nie nadpisuje ręcznie zmienionej klasyfikacji payoutu.
+    """
+    rows = [
+        dict(row) for row in db.execute(
+            """SELECT * FROM prop_firms
+               WHERE lower(replace(name, ' ', '')) IN ('lucidtrading','lucidflex','lucidflex(lucidtradinggroupllc)')
+               ORDER BY id"""
+        ).fetchall()
+    ]
+    flex = next((row for row in rows if "lucidflex" in row["name"].lower().replace(" ", "")), None)
+    legacy = [row for row in rows if row["name"].strip().lower() == "lucid trading"]
+
+    if flex is None and legacy:
+        flex = legacy.pop(0)
+        db.execute("UPDATE prop_firms SET name=? WHERE id=?", (LUCIDFLEX_PROFILE_NAME, flex["id"]))
+        flex["name"] = LUCIDFLEX_PROFILE_NAME
+    elif flex is None:
+        cursor = db.execute(
+            """INSERT INTO prop_firms
+               (name, default_tax_classification, qualification_status, dph_treatment, notes, active)
+               VALUES (?,?,?,?,?,1)""",
+            (LUCIDFLEX_PROFILE_NAME, "s7_60", "recommended", "review", LUCIDFLEX_PROFILE_NOTES),
+        )
+        flex_id = int(cursor.lastrowid)
+        flex = dict(db.execute("SELECT * FROM prop_firms WHERE id=?", (flex_id,)).fetchone())
+
+    flex_id = int(flex["id"])
+
+    # Jeżeli po wcześniejszych wersjach istnieją dwa profile, połącz payouty i zachowaj kontrahenta.
+    for old in legacy:
+        if not flex.get("contractor_id") and old.get("contractor_id"):
+            db.execute("UPDATE prop_firms SET contractor_id=? WHERE id=?", (old["contractor_id"], flex_id))
+            flex["contractor_id"] = old["contractor_id"]
+        db.execute("UPDATE prop_payouts SET prop_firm_id=? WHERE prop_firm_id=?", (flex_id, old["id"]))
+        db.execute("DELETE FROM prop_firms WHERE id=?", (old["id"],))
+
+    current = dict(db.execute("SELECT * FROM prop_firms WHERE id=?", (flex_id,)).fetchone())
+    updates: dict[str, Any] = {}
+
+    # Zachowaj ręcznie wybrany wariant 40%/wyłączenie. Domyślny stary wariant 60% pozostaje 60%.
+    if current.get("default_tax_classification") in {"", None, "s7_60"}:
+        updates["default_tax_classification"] = "s7_60"
+    # Stary status V8 był „unconfirmed”; po analizie umowy przechodzi na „recommended”.
+    if current.get("qualification_status") in {"", None, "unconfirmed"}:
+        updates["qualification_status"] = "recommended"
+    if not current.get("dph_treatment"):
+        updates["dph_treatment"] = "review"
+
+    existing_notes = (current.get("notes") or "").strip()
+    if "28.11.2025" not in existing_notes or "Konto live wymaga osobnej analizy" not in existing_notes:
+        if not existing_notes or existing_notes == LUCID_LEGACY_DEFAULT_NOTE:
+            updates["notes"] = LUCIDFLEX_PROFILE_NOTES
+        elif existing_notes != LUCIDFLEX_PROFILE_NOTES:
+            updates["notes"] = existing_notes + "\n\n" + LUCIDFLEX_PROFILE_NOTES
+
+    updates["name"] = LUCIDFLEX_PROFILE_NAME
+    if updates:
+        keys = list(updates)
+        db.execute(
+            "UPDATE prop_firms SET " + ",".join(f"{key}=?" for key in keys) + ",updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            tuple(updates[key] for key in keys) + (flex_id,),
+        )
+
+    # Dotychczasowe wpisy o domyślnej konfiguracji mogą bezpiecznie przejść z unconfirmed na recommended.
+    # Nie zmieniamy payoutów, które użytkownik ustawił na 40%, exclude albo confirmed.
+    db.execute(
+        """UPDATE prop_payouts
+           SET qualification_status='recommended', updated_at=CURRENT_TIMESTAMP
+           WHERE prop_firm_id=? AND tax_classification='s7_60' AND qualification_status='unconfirmed'""",
+        (flex_id,),
+    )
+    return flex_id
+
+def init_prop_firms_module() -> None:
+    """Dodaje moduł prop firm bez naruszania istniejących danych."""
+    db = get_db()
+    tables = {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    tax_columns = {row["name"] for row in db.execute("PRAGMA table_info(tax_settings)").fetchall()} if "tax_settings" in tables else set()
+    required_tax_columns = {"expense_40_percent", "expense_40_limit", "forecast_welding_revenue", "forecast_prop_revenue"}
+    schema_change = "prop_firms" not in tables or "prop_payouts" not in tables or not required_tax_columns.issubset(tax_columns)
+    lucid_migration_applied = False
+    if "app_migrations" in tables:
+        lucid_migration_applied = db.execute(
+            "SELECT 1 FROM app_migrations WHERE migration_key=?",
+            (LUCIDFLEX_MIGRATION_KEY,),
+        ).fetchone() is not None
+    migration_needed = schema_change or not lucid_migration_applied
+
+    migration_backup: Path | None = None
+    if migration_needed and DB_PATH.exists() and DB_PATH.stat().st_size:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        migration_backup = BACKUP_DIR / f"przed_aktualizacja_V8_1_LucidFlex_{timestamp}.sqlite3"
+        target = sqlite3.connect(migration_backup)
+        try:
+            db.backup(target)
+        finally:
+            target.close()
+        if REMOTE_DB_ENABLED:
+            upload_file_to_supabase(migration_backup, f"backups/migration_V8_1_LucidFlex_{timestamp}.sqlite3")
+
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS prop_firms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            contractor_id INTEGER,
+            default_tax_classification TEXT NOT NULL DEFAULT 's7_60',
+            qualification_status TEXT NOT NULL DEFAULT 'unconfirmed',
+            dph_treatment TEXT NOT NULL DEFAULT 'review',
+            notes TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (contractor_id) REFERENCES contractors(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS prop_payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prop_firm_id INTEGER NOT NULL,
+            payout_identifier TEXT NOT NULL DEFAULT '',
+            received_date TEXT NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'USD',
+            gross_amount TEXT NOT NULL,
+            operator_fee TEXT NOT NULL DEFAULT '0',
+            net_amount TEXT NOT NULL,
+            czk_rate TEXT NOT NULL,
+            income_czk TEXT NOT NULL,
+            linked_invoice_id INTEGER UNIQUE,
+            tax_classification TEXT NOT NULL DEFAULT 's7_60',
+            qualification_status TEXT NOT NULL DEFAULT 'unconfirmed',
+            dph_treatment TEXT NOT NULL DEFAULT 'review',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (prop_firm_id) REFERENCES prop_firms(id) ON DELETE RESTRICT,
+            FOREIGN KEY (linked_invoice_id) REFERENCES invoices(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_prop_payouts_received_date ON prop_payouts(received_date);
+        CREATE INDEX IF NOT EXISTS idx_prop_payouts_firm ON prop_payouts(prop_firm_id);
+        CREATE TABLE IF NOT EXISTS app_migrations (
+            migration_key TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    tax_columns = {row["name"] for row in db.execute("PRAGMA table_info(tax_settings)").fetchall()}
+    additions = {
+        "expense_40_percent": "TEXT NOT NULL DEFAULT '40'",
+        "expense_40_limit": "TEXT NOT NULL DEFAULT '800000'",
+        "forecast_welding_revenue": "TEXT NOT NULL DEFAULT '0'",
+        "forecast_prop_revenue": "TEXT NOT NULL DEFAULT '0'",
+    }
+    for column, definition in additions.items():
+        if column not in tax_columns:
+            db.execute(f"ALTER TABLE tax_settings ADD COLUMN {column} {definition}")
+
+    seed_firms = (
+        (
+            "MyFundedFutures (MFF)", "s7_60", "recommended", "review",
+            "Rekomendowana kwalifikacja na podstawie przeanalizowanej umowy: regularny przychód §7, koszty 60%. Ocena niewiążąca dla urzędu.",
+        ),
+    )
+    for name, classification, status, dph, notes in seed_firms:
+        exists = db.execute("SELECT id FROM prop_firms WHERE lower(name)=lower(?)", (name,)).fetchone()
+        if exists is None:
+            db.execute(
+                "INSERT INTO prop_firms (name, default_tax_classification, qualification_status, dph_treatment, notes, active) VALUES (?,?,?,?,?,1)",
+                (name, classification, status, dph, notes),
+            )
+
+    if not lucid_migration_applied:
+        migrate_lucidflex_profile(db)
+        db.execute(
+            "INSERT OR REPLACE INTO app_migrations (migration_key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+            (LUCIDFLEX_MIGRATION_KEY,),
+        )
+    db.commit()
+
 with app.app_context():
     init_db()
     init_tax_module()
+    init_prop_firms_module()
     if REMOTE_DB_ENABLED:
         upload_remote_database()
 
@@ -2442,6 +3027,15 @@ def inject_globals() -> dict[str, Any]:
 
 
 @app.context_processor
+def inject_prop_globals() -> dict[str, Any]:
+    return {
+        "PROP_TAX_CLASSIFICATIONS": PROP_TAX_CLASSIFICATIONS,
+        "PROP_QUALIFICATION_STATUSES": PROP_QUALIFICATION_STATUSES,
+        "PROP_DPH_TREATMENTS": PROP_DPH_TREATMENTS,
+        "LUCIDFLEX_PROFILE_NAME": LUCIDFLEX_PROFILE_NAME,
+    }
+
+@app.context_processor
 def inject_v7_globals() -> dict[str, Any]:
     return {"auth_enabled": bool(APP_PASSWORD), "cloud_mode": CLOUD_MODE}
 
@@ -2524,7 +3118,7 @@ def manifest():
 def service_worker():
     # Nie cache'ujemy danych finansowych offline. SW daje instalowalność PWA
     # i prosty fallback dla powłoki aplikacji.
-    script = """const CACHE='faktury-shell-v7';
+    script = """const CACHE='faktury-shell-v8';
 self.addEventListener('install',e=>{self.skipWaiting();});
 self.addEventListener('activate',e=>{e.waitUntil(self.clients.claim());});
 self.addEventListener('fetch',e=>{
@@ -2845,6 +3439,263 @@ def validate_expense(expense: dict[str, Any]) -> list[str]:
     return errors
 
 
+def prop_firm_payload(existing_id: int | None = None) -> dict[str, Any]:
+    contractor_raw = request.form.get("contractor_id", "").strip()
+    return {
+        "id": existing_id,
+        "name": request.form.get("name", "").strip(),
+        "contractor_id": int(contractor_raw) if contractor_raw.isdigit() else None,
+        "default_tax_classification": request.form.get("default_tax_classification", "s7_60"),
+        "qualification_status": request.form.get("qualification_status", "unconfirmed"),
+        "dph_treatment": request.form.get("dph_treatment", "review"),
+        "notes": request.form.get("notes", "").strip(),
+        "active": 1 if request.form.get("active") == "1" else 0,
+    }
+
+
+def validate_prop_firm(firm: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if not firm.get("name"):
+        errors.append("Podaj nazwę prop firmy.")
+    if firm.get("default_tax_classification") not in PROP_TAX_CLASSIFICATIONS:
+        errors.append("Wybierz prawidłową kwalifikację PIT.")
+    if firm.get("qualification_status") not in PROP_QUALIFICATION_STATUSES:
+        errors.append("Wybierz prawidłowy status kwalifikacji.")
+    if firm.get("dph_treatment") not in PROP_DPH_TREATMENTS:
+        errors.append("Wybierz prawidłową kwalifikację DPH.")
+    return errors
+
+
+def available_prop_invoices(current_payout_id: int | None = None) -> list[dict[str, Any]]:
+    db = get_db()
+    rows = db.execute(
+        """SELECT i.*, c.name AS contractor_name, pp.id AS linked_payout_id
+             FROM invoices i
+             JOIN contractors c ON c.id=i.contractor_id
+             LEFT JOIN prop_payouts pp ON pp.linked_invoice_id=i.id
+             WHERE pp.id IS NULL OR pp.id=?
+             ORDER BY i.issue_date DESC, i.id DESC""",
+        (current_payout_id or -1,),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for raw in rows:
+        item = dict(raw)
+        item_rows = db.execute("SELECT * FROM invoice_items WHERE invoice_id=?", (item["id"],)).fetchall()
+        totals = calculate_items([dict(row) for row in item_rows], item["tax_mode"])
+        item["total"] = totals["total_gross"]
+        result.append(item)
+    return result
+
+
+def prop_payout_payload(existing_id: int | None = None) -> dict[str, Any]:
+    firm_raw = request.form.get("prop_firm_id", "").strip()
+    invoice_raw = request.form.get("linked_invoice_id", "").strip()
+    gross = parse_decimal(request.form.get("gross_amount", ""), "kwota należna po profit split")
+    fee = parse_decimal(request.form.get("operator_fee", "0"), "opłata operatora")
+    net_raw = request.form.get("net_amount", "").strip()
+    net = parse_decimal(net_raw, "kwota netto") if net_raw else gross - fee
+    currency = request.form.get("currency", "USD").strip().upper()
+    rate = Decimal("1") if currency == "CZK" else parse_decimal(request.form.get("czk_rate", ""), "kurs do CZK")
+    amounts = payout_amount_breakdown(gross, fee, net, rate)
+    return {
+        "id": existing_id,
+        "prop_firm_id": int(firm_raw) if firm_raw.isdigit() else None,
+        "payout_identifier": request.form.get("payout_identifier", "").strip(),
+        "received_date": request.form.get("received_date", "").strip(),
+        "currency": currency,
+        "gross_amount": str(gross),
+        "operator_fee": str(fee),
+        "net_amount": str(net),
+        "czk_rate": str(rate),
+        "income_czk": str(amounts["income_czk"]),
+        "linked_invoice_id": int(invoice_raw) if invoice_raw.isdigit() else None,
+        "tax_classification": request.form.get("tax_classification", "s7_60"),
+        "qualification_status": request.form.get("qualification_status", "unconfirmed"),
+        "dph_treatment": request.form.get("dph_treatment", "review"),
+        "notes": request.form.get("notes", "").strip(),
+    }
+
+
+def prop_payout_form_values(base: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Zachowuje wpisane pola formularza, gdy walidacja kwot zakończy się błędem."""
+    values = dict(base or {})
+    for key in (
+        "prop_firm_id", "payout_identifier", "received_date", "currency",
+        "gross_amount", "operator_fee", "net_amount", "czk_rate",
+        "linked_invoice_id", "tax_classification", "qualification_status",
+        "dph_treatment", "notes",
+    ):
+        if key in request.form:
+            values[key] = request.form.get(key, "")
+    try:
+        gross = parse_decimal(values.get("gross_amount", "0"))
+        rate = Decimal("1") if str(values.get("currency", "")).upper() == "CZK" else parse_decimal(values.get("czk_rate", "0"))
+        values["income_czk"] = str(q2(gross * rate)) if gross >= 0 and rate >= 0 else ""
+    except ValueError:
+        values["income_czk"] = ""
+    return values
+
+
+def validate_prop_payout(payout: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    db = get_db()
+    if payout.get("prop_firm_id") is None or db.execute("SELECT 1 FROM prop_firms WHERE id=?", (payout.get("prop_firm_id"),)).fetchone() is None:
+        errors.append("Wybierz prop firmę.")
+    try:
+        date.fromisoformat(payout.get("received_date", ""))
+    except ValueError:
+        errors.append("Podaj prawidłową datę otrzymania payoutu.")
+    try:
+        gross = parse_decimal(payout.get("gross_amount")); fee = parse_decimal(payout.get("operator_fee")); net = parse_decimal(payout.get("net_amount")); rate = parse_decimal(payout.get("czk_rate"))
+        if gross <= 0: errors.append("Kwota payoutu musi być większa od zera.")
+        if fee < 0 or net < 0: errors.append("Opłata i kwota netto nie mogą być ujemne.")
+        if fee > gross: errors.append("Opłata operatora nie może przewyższać kwoty należnej.")
+        if net > gross: errors.append("Kwota netto nie może przewyższać kwoty należnej po profit split.")
+        if rate <= 0: errors.append("Kurs do CZK musi być większy od zera.")
+    except ValueError as exc:
+        errors.append(str(exc))
+    if not payout.get("currency") or len(payout["currency"]) > 8:
+        errors.append("Podaj poprawny kod waluty.")
+    if payout.get("tax_classification") not in PROP_TAX_CLASSIFICATIONS:
+        errors.append("Wybierz kwalifikację PIT.")
+    if payout.get("qualification_status") not in PROP_QUALIFICATION_STATUSES:
+        errors.append("Wybierz status kwalifikacji.")
+    if payout.get("dph_treatment") not in PROP_DPH_TREATMENTS:
+        errors.append("Wybierz kwalifikację DPH.")
+    linked = payout.get("linked_invoice_id")
+    if linked is not None:
+        if db.execute("SELECT 1 FROM invoices WHERE id=?", (linked,)).fetchone() is None:
+            errors.append("Wybrana faktura nie istnieje.")
+        duplicate = db.execute("SELECT id FROM prop_payouts WHERE linked_invoice_id=? AND id<>?", (linked, payout.get("id") or -1)).fetchone()
+        if duplicate is not None:
+            errors.append("Ta faktura jest już powiązana z innym payoutem.")
+    return errors
+
+
+@app.route("/prop-firms")
+def prop_firms_dashboard() -> str:
+    db = get_db()
+    try:
+        selected_year = int(request.args.get("year", date.today().year))
+    except ValueError:
+        selected_year = date.today().year
+    try:
+        selected_firm_id = int(request.args.get("firm_id", "")) if request.args.get("firm_id") else None
+    except ValueError:
+        selected_firm_id = None
+    firms_all = [dict(row) for row in db.execute("""SELECT f.*, c.name AS contractor_name FROM prop_firms f LEFT JOIN contractors c ON c.id=f.contractor_id ORDER BY f.active DESC,f.name COLLATE NOCASE""").fetchall()]
+    firms = [firm for firm in firms_all if firm["active"]]
+    sql = """SELECT p.*, f.name AS firm_name, i.invoice_number FROM prop_payouts p JOIN prop_firms f ON f.id=p.prop_firm_id LEFT JOIN invoices i ON i.id=p.linked_invoice_id WHERE substr(p.received_date,1,4)=?"""
+    params: list[Any] = [str(selected_year)]
+    if selected_firm_id is not None:
+        sql += " AND p.prop_firm_id=?"; params.append(selected_firm_id)
+    sql += " ORDER BY p.received_date DESC,p.id DESC"
+    payouts = [dict(row) for row in db.execute(sql, params).fetchall()]
+    gross_czk = fee_czk = net_czk = Decimal("0")
+    for payout in payouts:
+        amounts = payout_amount_breakdown(parse_decimal(payout["gross_amount"]), parse_decimal(payout["operator_fee"]), parse_decimal(payout["net_amount"]), parse_decimal(payout["czk_rate"]))
+        payout.update(amounts); gross_czk += amounts["income_czk"]; fee_czk += amounts["fee_czk"]; net_czk += amounts["net_czk"]
+    summary = {"gross_czk": q2(gross_czk), "fee_czk": q2(fee_czk), "net_czk": q2(net_czk), "count": len(payouts)}
+    return render_template("prop_firms.html", firms=firms, firms_all=firms_all, payouts=payouts, summary=summary, selected_year=selected_year, selected_firm_id=selected_firm_id)
+
+
+@app.route("/prop-firms/new", methods=["GET", "POST"])
+def prop_firm_new() -> str:
+    db = get_db(); contractors = [dict(row) for row in db.execute("SELECT * FROM contractors ORDER BY name COLLATE NOCASE").fetchall()]
+    firm = {"id": None, "name": "", "contractor_id": "", "default_tax_classification": "s7_60", "qualification_status": "unconfirmed", "dph_treatment": "review", "notes": "", "active": 1}
+    if request.method == "POST":
+        firm = prop_firm_payload(); errors = validate_prop_firm(firm)
+        if errors:
+            for error in errors: flash(error, "error")
+            return render_template("prop_firm_form.html", firm=firm, contractors=contractors, is_edit=False)
+        try:
+            db.execute("INSERT INTO prop_firms (name,contractor_id,default_tax_classification,qualification_status,dph_treatment,notes,active) VALUES (?,?,?,?,?,?,?)", (firm["name"], firm["contractor_id"], firm["default_tax_classification"], firm["qualification_status"], firm["dph_treatment"], firm["notes"], firm["active"]))
+            db.commit()
+        except sqlite3.IntegrityError:
+            flash("Firma o tej nazwie już istnieje.", "error")
+            return render_template("prop_firm_form.html", firm=firm, contractors=contractors, is_edit=False)
+        flash("Prop firma została dodana.", "success"); return redirect(url_for("prop_firms_dashboard"))
+    return render_template("prop_firm_form.html", firm=firm, contractors=contractors, is_edit=False)
+
+
+@app.route("/prop-firms/<int:firm_id>/edit", methods=["GET", "POST"])
+def prop_firm_edit(firm_id: int) -> str:
+    db = get_db(); row = db.execute("SELECT * FROM prop_firms WHERE id=?", (firm_id,)).fetchone()
+    if row is None: abort(404)
+    contractors = [dict(r) for r in db.execute("SELECT * FROM contractors ORDER BY name COLLATE NOCASE").fetchall()]
+    firm = dict(row)
+    if request.method == "POST":
+        firm = prop_firm_payload(firm_id); errors = validate_prop_firm(firm)
+        if errors:
+            for error in errors: flash(error, "error")
+            return render_template("prop_firm_form.html", firm=firm, contractors=contractors, is_edit=True)
+        try:
+            db.execute("""UPDATE prop_firms SET name=?,contractor_id=?,default_tax_classification=?,qualification_status=?,dph_treatment=?,notes=?,active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""", (firm["name"], firm["contractor_id"], firm["default_tax_classification"], firm["qualification_status"], firm["dph_treatment"], firm["notes"], firm["active"], firm_id)); db.commit()
+        except sqlite3.IntegrityError:
+            flash("Firma o tej nazwie już istnieje.", "error")
+            return render_template("prop_firm_form.html", firm=firm, contractors=contractors, is_edit=True)
+        flash("Ustawienia prop firmy zostały zapisane.", "success"); return redirect(url_for("prop_firms_dashboard"))
+    return render_template("prop_firm_form.html", firm=firm, contractors=contractors, is_edit=True)
+
+
+@app.post("/prop-firms/<int:firm_id>/delete")
+def prop_firm_delete(firm_id: int):
+    db = get_db()
+    count = db.execute("SELECT COUNT(*) AS c FROM prop_payouts WHERE prop_firm_id=?", (firm_id,)).fetchone()["c"]
+    if count:
+        flash("Nie można usunąć firmy mającej payouty. Oznacz ją jako nieaktywną.", "error")
+    else:
+        db.execute("DELETE FROM prop_firms WHERE id=?", (firm_id,)); db.commit(); flash("Prop firma została usunięta.", "success")
+    return redirect(url_for("prop_firms_dashboard"))
+
+
+@app.route("/prop-payouts/new", methods=["GET", "POST"])
+def prop_payout_new() -> str:
+    db = get_db(); firms = [dict(row) for row in db.execute("SELECT * FROM prop_firms WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()]
+    if not firms:
+        flash("Najpierw dodaj prop firmę.", "error"); return redirect(url_for("prop_firm_new"))
+    selected_firm = next((f for f in firms if str(f["id"]) == request.args.get("firm_id")), firms[0])
+    payout = {"id": None, "prop_firm_id": selected_firm["id"], "payout_identifier": "", "received_date": date.today().isoformat(), "currency": "USD", "gross_amount": "", "operator_fee": "0", "net_amount": "", "czk_rate": "", "income_czk": "", "linked_invoice_id": request.args.get("invoice_id", ""), "tax_classification": selected_firm["default_tax_classification"], "qualification_status": selected_firm["qualification_status"], "dph_treatment": selected_firm["dph_treatment"], "notes": ""}
+    invoices = available_prop_invoices()
+    if request.method == "POST":
+        try: payout = prop_payout_payload()
+        except ValueError as exc:
+            flash(str(exc), "error"); return render_template("prop_payout_form.html", payout=prop_payout_form_values(payout), firms=firms, invoices=invoices, is_edit=False)
+        errors = validate_prop_payout(payout)
+        if errors:
+            for error in errors: flash(error, "error")
+            return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=False)
+        db.execute("""INSERT INTO prop_payouts (prop_firm_id,payout_identifier,received_date,currency,gross_amount,operator_fee,net_amount,czk_rate,income_czk,linked_invoice_id,tax_classification,qualification_status,dph_treatment,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", tuple(payout[key] for key in ("prop_firm_id","payout_identifier","received_date","currency","gross_amount","operator_fee","net_amount","czk_rate","income_czk","linked_invoice_id","tax_classification","qualification_status","dph_treatment","notes"))); db.commit()
+        flash("Payout został zapisany.", "success"); return redirect(url_for("prop_firms_dashboard", year=payout["received_date"][:4]))
+    return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=False)
+
+
+@app.route("/prop-payouts/<int:payout_id>/edit", methods=["GET", "POST"])
+def prop_payout_edit(payout_id: int) -> str:
+    db = get_db(); row = db.execute("SELECT * FROM prop_payouts WHERE id=?", (payout_id,)).fetchone()
+    if row is None: abort(404)
+    firms = [dict(r) for r in db.execute("SELECT * FROM prop_firms ORDER BY active DESC,name COLLATE NOCASE").fetchall()]
+    payout = dict(row); invoices = available_prop_invoices(payout_id)
+    if request.method == "POST":
+        try: payout = prop_payout_payload(payout_id)
+        except ValueError as exc:
+            flash(str(exc), "error"); return render_template("prop_payout_form.html", payout=prop_payout_form_values(payout), firms=firms, invoices=invoices, is_edit=True)
+        errors = validate_prop_payout(payout)
+        if errors:
+            for error in errors: flash(error, "error")
+            return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=True)
+        db.execute("""UPDATE prop_payouts SET prop_firm_id=?,payout_identifier=?,received_date=?,currency=?,gross_amount=?,operator_fee=?,net_amount=?,czk_rate=?,income_czk=?,linked_invoice_id=?,tax_classification=?,qualification_status=?,dph_treatment=?,notes=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""", tuple(payout[key] for key in ("prop_firm_id","payout_identifier","received_date","currency","gross_amount","operator_fee","net_amount","czk_rate","income_czk","linked_invoice_id","tax_classification","qualification_status","dph_treatment","notes")) + (payout_id,)); db.commit()
+        flash("Payout został zaktualizowany.", "success"); return redirect(url_for("prop_firms_dashboard", year=payout["received_date"][:4]))
+    return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=True)
+
+
+@app.post("/prop-payouts/<int:payout_id>/delete")
+def prop_payout_delete(payout_id: int):
+    db = get_db(); row = db.execute("SELECT received_date FROM prop_payouts WHERE id=?", (payout_id,)).fetchone()
+    if row is None: abort(404)
+    db.execute("DELETE FROM prop_payouts WHERE id=?", (payout_id,)); db.commit(); flash("Payout został usunięty.", "success")
+    return redirect(url_for("prop_firms_dashboard", year=str(row["received_date"])[:4]))
+
 @app.route("/expenses")
 def expenses_page() -> str:
     today = date.today()
@@ -2929,6 +3780,82 @@ def expenses_export_csv():
     return Response(data, mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=koszty_{year}_{month:02d}.csv"})
 
 
+
+def percentage_cost(revenue: Decimal, percent: Decimal, annual_limit: Decimal) -> Decimal:
+    revenue = max(revenue, Decimal("0"))
+    percent = min(max(percent, Decimal("0")), Decimal("100"))
+    annual_limit = max(annual_limit, Decimal("0"))
+    return q2(min(revenue * percent / Decimal("100"), annual_limit))
+
+
+def calculate_grouped_percentage_costs(
+    group60_revenue: Decimal,
+    group40_revenue: Decimal,
+    percent60: Decimal,
+    limit60: Decimal,
+    percent40: Decimal,
+    limit40: Decimal,
+) -> dict[str, Decimal]:
+    expenses60 = percentage_cost(group60_revenue, percent60, limit60)
+    expenses40 = percentage_cost(group40_revenue, percent40, limit40)
+    return {
+        "flat_expenses_60": expenses60,
+        "flat_expenses_40": expenses40,
+        "flat_expenses": q2(expenses60 + expenses40),
+        "profit_60": q2(max(group60_revenue - expenses60, Decimal("0"))),
+        "profit_40": q2(max(group40_revenue - expenses40, Decimal("0"))),
+        "profit": q2(max(group60_revenue - expenses60, Decimal("0")) + max(group40_revenue - expenses40, Decimal("0"))),
+    }
+
+
+def payout_amount_breakdown(gross: Decimal, fee: Decimal, net: Decimal, rate: Decimal) -> dict[str, Decimal]:
+    gross = max(gross, Decimal("0")); fee = max(fee, Decimal("0")); net = max(net, Decimal("0")); rate = max(rate, Decimal("0"))
+    return {
+        "income_czk": q2(gross * rate),
+        "fee_czk": q2(fee * rate),
+        "net_czk": q2(net * rate),
+    }
+
+
+def settlement_balance(obligation: Decimal, paid: Decimal) -> tuple[Decimal, Decimal]:
+    balance = q2(obligation - paid)
+    return q2(max(balance, Decimal("0"))), q2(max(-balance, Decimal("0")))
+
+
+def exclude_linked_invoice_rows(rows: list[dict[str, Any]], linked_invoice_ids: set[int]) -> list[dict[str, Any]]:
+    return [row for row in rows if int(row.get("id", 0)) not in linked_invoice_ids]
+
+
+def prop_payout_rows(year: int) -> tuple[list[dict[str, Any]], list[str]]:
+    db = get_db()
+    rows = db.execute(
+        """SELECT p.*, f.name AS firm_name, i.invoice_number
+             FROM prop_payouts p
+             JOIN prop_firms f ON f.id=p.prop_firm_id
+             LEFT JOIN invoices i ON i.id=p.linked_invoice_id
+             WHERE substr(p.received_date,1,4)=?
+             ORDER BY p.received_date, p.id""",
+        (str(year),),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for raw in rows:
+        item = dict(raw)
+        try:
+            gross = parse_decimal(item.get("gross_amount"), "kwota payoutu")
+            fee = parse_decimal(item.get("operator_fee"), "opłata operatora")
+            net = parse_decimal(item.get("net_amount"), "kwota netto")
+            rate = parse_decimal(item.get("czk_rate"), "kurs payoutu")
+            amounts = payout_amount_breakdown(gross, fee, net, rate)
+        except ValueError as exc:
+            warnings.append(f"Payout {item.get('payout_identifier') or item.get('id')}: {exc}; pominięto w kalkulacji.")
+            continue
+        item.update(amounts)
+        # Przychód zapisany jest audytowalnie w bazie, ale kalkulator ponownie sprawdza wzór brutto × kurs.
+        item["stored_income_czk"] = item.get("income_czk", "")
+        item["income_czk"] = amounts["income_czk"]
+        result.append(item)
+    return result, warnings
 
 def ensure_tax_settings(year: int) -> dict[str, Any]:
     db = get_db()
@@ -3028,13 +3955,17 @@ def progressive_tax(base: Decimal, threshold: Decimal) -> Decimal:
 
 def tax_invoice_rows(year: int, basis: str) -> tuple[list[dict[str, Any]], list[str]]:
     db = get_db()
+    linked_invoice_ids = {
+        int(row["linked_invoice_id"])
+        for row in db.execute("SELECT linked_invoice_id FROM prop_payouts WHERE linked_invoice_id IS NOT NULL").fetchall()
+    }
     rows = db.execute("""SELECT i.*, c.name AS contractor_name, c.vat_id AS contractor_vat_id
                          FROM invoices i JOIN contractors c ON c.id=i.contractor_id
                          ORDER BY i.issue_date, i.id""").fetchall()
+    candidates = exclude_linked_invoice_rows([dict(row) for row in rows], linked_invoice_ids)
     result: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for raw in rows:
-        invoice = dict(raw)
+    for invoice in candidates:
         if basis == "paid":
             if invoice.get("status") != "paid":
                 continue
@@ -3060,17 +3991,44 @@ def tax_invoice_rows(year: int, basis: str) -> tuple[list[dict[str, Any]], list[
         taxable_amount = totals["total_net"] if invoice.get("tax_mode") == "vat" else totals["total_gross"]
         invoice["recognized_date"] = recognized_date.isoformat()
         invoice["value_czk"] = q2(taxable_amount * rate)
+        invoice["tax_classification"] = "s7_60"
         result.append(invoice)
     return result, warnings
+
 
 
 def compute_tax_snapshot(year: int) -> dict[str, Any]:
     settings = ensure_tax_settings(year)
     warnings: list[str] = []
+    assumptions: list[str] = []
     basis = settings.get("revenue_basis", "paid")
+
     invoice_rows, invoice_warnings = tax_invoice_rows(year, basis)
-    warnings.extend(invoice_warnings)
-    revenue = q2(sum((row["value_czk"] for row in invoice_rows), Decimal("0")))
+    payout_rows, payout_warnings = prop_payout_rows(year)
+    warnings.extend(invoice_warnings); warnings.extend(payout_warnings)
+
+    welding_revenue = q2(sum((row["value_czk"] for row in invoice_rows), Decimal("0")))
+    prop_rows_60 = [row for row in payout_rows if row.get("tax_classification") == "s7_60"]
+    prop_rows_40 = [row for row in payout_rows if row.get("tax_classification") == "s7_40"]
+    prop_rows_excluded = [row for row in payout_rows if row.get("tax_classification") == "exclude"]
+    prop_rows_included = prop_rows_60 + prop_rows_40
+    prop_revenue_60 = q2(sum((row["income_czk"] for row in prop_rows_60), Decimal("0")))
+    prop_revenue_40 = q2(sum((row["income_czk"] for row in prop_rows_40), Decimal("0")))
+    prop_revenue = q2(prop_revenue_60 + prop_revenue_40)
+    prop_excluded_revenue = q2(sum((row["income_czk"] for row in prop_rows_excluded), Decimal("0")))
+    prop_operator_fees_czk = q2(sum((row["fee_czk"] for row in payout_rows), Decimal("0")))
+    prop_net_czk = q2(sum((row["net_czk"] for row in payout_rows), Decimal("0")))
+
+    for row in payout_rows:
+        status = row.get("qualification_status")
+        if status == "unconfirmed":
+            warnings.append(f"{row['firm_name']}: payout {date_pl_filter(row['received_date'])} opiera się na kwalifikacji do potwierdzenia.")
+        elif status == "recommended":
+            message = f"{row['firm_name']}: zastosowano rekomendowaną, niewiążącą kwalifikację {PROP_TAX_CLASSIFICATIONS.get(row.get('tax_classification'), row.get('tax_classification'))}."
+            if message not in assumptions:
+                assumptions.append(message)
+    if prop_rows_excluded:
+        warnings.append(f"{len(prop_rows_excluded)} payoutów o wartości {format_decimal(prop_excluded_revenue)} CZK wyłączono z automatycznego kalkulatora.")
 
     def d(key: str, default: str = "0") -> Decimal:
         try:
@@ -3079,20 +4037,35 @@ def compute_tax_snapshot(year: int) -> dict[str, Any]:
             warnings.append(f"Nieprawidłowe ustawienie {key}; użyto {default}.")
             return Decimal(default)
 
-    expense_percent = min(max(d("expense_percent", "60"), Decimal("0")), Decimal("100"))
+    group60_revenue = q2(welding_revenue + prop_revenue_60)
+    group40_revenue = prop_revenue_40
+    grouped = calculate_grouped_percentage_costs(
+        group60_revenue,
+        group40_revenue,
+        d("expense_percent", "60"),
+        d("expense_limit", "1200000"),
+        d("expense_40_percent", "40"),
+        d("expense_40_limit", "800000"),
+    )
+    flat_expenses_60 = grouped["flat_expenses_60"]
+    flat_expenses_40 = grouped["flat_expenses_40"]
+    flat_expenses = grouped["flat_expenses"]
+    profit_60 = grouped["profit_60"]
+    profit_40 = grouped["profit_40"]
+    profit = grouped["profit"]
+    revenue = q2(group60_revenue + group40_revenue)
+
     expense_limit = max(d("expense_limit", "1200000"), Decimal("0"))
-    flat_expenses = q2(min(revenue * expense_percent / Decimal("100"), expense_limit))
-    profit = q2(max(revenue - flat_expenses, Decimal("0")))
+    group60_limit_usage_percent = q2(flat_expenses_60 / expense_limit * Decimal("100")) if expense_limit else Decimal("0")
 
     employment_base = max(d("employment_tax_base"), Decimal("0"))
     employment_tax_withheld = max(d("employment_tax_withheld"), Decimal("0"))
     tax_threshold = max(d("tax_threshold", "1762812"), Decimal("0"))
     annual_credit = max(d("income_tax_credit", "30840"), Decimal("0"))
     annual_tax_before_credit = progressive_tax(employment_base + profit, tax_threshold)
-    annual_tax_after_credit = max(annual_tax_before_credit - annual_credit, Decimal("0"))
-    income_tax = q2(max(annual_tax_after_credit - employment_tax_withheld, Decimal("0")))
+    annual_tax_after_credit = q2(max(annual_tax_before_credit - annual_credit, Decimal("0")))
     if year == 2026 and employment_base == 0:
-        warnings.append("W 2026 byłeś zatrudniony w Accenture do 31.07. Wpisz podstawę podatku i pobrane zaliczki z dokumentu „Potvrzení o zdanitelných příjmech”, inaczej podatek będzie tylko przybliżeniem.")
+        warnings.append("Brak podstawy podatku z zatrudnienia w Accenture – roczne wyliczenie podatku jest niepełne.")
 
     active_months = active_months_for_year(settings, year)
     cssz_mode = settings.get("cssz_mode", "main")
@@ -3112,26 +4085,19 @@ def compute_tax_snapshot(year: int) -> dict[str, Any]:
     min_main_assessment = ceil_whole(cssz_main_min_month * Decimal(cssz_main_months))
     min_secondary_assessment = ceil_whole(cssz_secondary_min_month * Decimal(cssz_secondary_months))
     cssz_assessment = Decimal("0")
-
     if cssz_mode == "secondary":
         if active_months and profit >= cssz_threshold:
             cssz_assessment = max(ceil_whole(profit * cssz_assessment_percent / Decimal("100")), min_secondary_assessment)
         else:
-            warnings.append(f"ČSSZ vedlejší: zysk jest poniżej progu {format_decimal(cssz_threshold,0)} CZK, więc wyliczono 0 CZK.")
+            warnings.append(f"ČSSZ vedlejší: dochód jest poniżej progu {format_decimal(cssz_threshold,0)} CZK; wyliczono 0 CZK.")
     elif cssz_mode == "main":
         cssz_assessment = max(ceil_whole(profit * cssz_assessment_percent / Decimal("100")), min_main_assessment)
     elif cssz_mode == "mixed":
         secondary_part_required = cssz_secondary_months > 0 and secondary_profit >= cssz_threshold
         if secondary_part_required:
-            cssz_assessment = max(
-                calc_main_assessment + calc_secondary_assessment,
-                min_main_assessment + min_secondary_assessment,
-                min_main_assessment + calc_secondary_assessment,
-            )
+            cssz_assessment = max(calc_main_assessment + calc_secondary_assessment, min_main_assessment + min_secondary_assessment, min_main_assessment + calc_secondary_assessment)
         else:
             cssz_assessment = max(calc_main_assessment, min_main_assessment)
-            if cssz_secondary_months:
-                warnings.append(f"Część vedlejší ČSSZ: przypisany zysk {format_decimal(secondary_profit,0)} CZK jest poniżej progu {format_decimal(cssz_threshold,0)} CZK; składkę naliczono tylko za część hlavní.")
     else:
         cssz_assessment = ceil_whole(profit * cssz_assessment_percent / Decimal("100"))
     cssz = ceil_whole(cssz_assessment * cssz_rate / Decimal("100")) if cssz_assessment > 0 else Decimal("0")
@@ -3158,47 +4124,54 @@ def compute_tax_snapshot(year: int) -> dict[str, Any]:
             warnings.append("Pominięto nieprawidłowy zapis wpłaty.")
     paid = {key: q2(value) for key, value in paid.items()}
 
-    # V6: pełne rozliczenie podatku dochodowego.
-    # Od szacowanego podatku rocznego po uldze odejmujemy zaliczki pobrane
-    # przez Accenture oraz dodatkowe wpłaty podatku zapisane w aplikacji.
     income_tax_paid_total = q2(employment_tax_withheld + paid.get("income_tax", Decimal("0")))
-    income_tax_balance = q2(annual_tax_after_credit - income_tax_paid_total)
-    income_tax_underpayment = q2(max(income_tax_balance, Decimal("0")))
-    income_tax_overpayment = q2(max(-income_tax_balance, Decimal("0")))
-    income_tax = income_tax_underpayment
-
-    obligations = {"income_tax": annual_tax_after_credit, "cssz": cssz, "vzp": vzp}
-    remaining = {
-        "income_tax": income_tax_underpayment,
-        "cssz": q2(max(cssz - paid.get("cssz", Decimal("0")), Decimal("0"))),
-        "vzp": q2(max(vzp - paid.get("vzp", Decimal("0")), Decimal("0"))),
-    }
+    income_tax_underpayment, income_tax_overpayment = settlement_balance(annual_tax_after_credit, income_tax_paid_total)
+    cssz_underpayment, cssz_overpayment = settlement_balance(q2(cssz), paid.get("cssz", Decimal("0")))
+    vzp_underpayment, vzp_overpayment = settlement_balance(vzp, paid.get("vzp", Decimal("0")))
+    remaining = {"income_tax": income_tax_underpayment, "cssz": cssz_underpayment, "vzp": vzp_underpayment}
+    overpayments = {"income_tax": income_tax_overpayment, "cssz": cssz_overpayment, "vzp": vzp_overpayment}
+    remaining_total = q2(sum(remaining.values(), Decimal("0")))
+    total_overpayment = q2(sum(overpayments.values(), Decimal("0")))
     total_obligation = q2(annual_tax_after_credit + cssz + vzp)
     total_paid = q2(income_tax_paid_total + paid.get("cssz", Decimal("0")) + paid.get("vzp", Decimal("0")))
-    remaining_total = q2(sum(remaining.values(), Decimal("0")))
     after_obligations = q2(revenue - remaining_total)
-    if basis == "paid" and not invoice_rows:
-        warnings.append("Wybrano przychód według zapłaty. Oznacz faktury jako opłacone i wpisz datę otrzymania pieniędzy.")
+
+    forecast_welding_revenue = max(d("forecast_welding_revenue"), Decimal("0"))
+    forecast_prop_revenue = max(d("forecast_prop_revenue"), Decimal("0"))
+    forecast_total = q2(forecast_welding_revenue + forecast_prop_revenue)
+
+    if basis == "paid" and not invoice_rows and not payout_rows:
+        warnings.append("Brak rzeczywiście otrzymanych przychodów w tym roku.")
+
     return {
-        "year": year, "settings": settings, "invoice_rows": invoice_rows, "warnings": warnings,
-        "revenue": revenue, "flat_expenses": flat_expenses, "profit": profit,
-        "income_tax": income_tax,
-        "annual_tax_before_credit": annual_tax_before_credit,
-        "annual_tax_after_credit": q2(annual_tax_after_credit),
-        "employment_tax_withheld": employment_tax_withheld,
-        "income_tax_paid_total": income_tax_paid_total,
-        "income_tax_balance": income_tax_balance,
-        "income_tax_underpayment": income_tax_underpayment,
+        "year": year, "settings": settings, "warnings": warnings, "assumptions": assumptions,
+        "invoice_rows": invoice_rows, "prop_rows": payout_rows, "prop_rows_included": prop_rows_included,
+        "prop_rows_excluded": prop_rows_excluded,
+        "welding_revenue": welding_revenue, "prop_revenue": prop_revenue,
+        "prop_revenue_60": prop_revenue_60, "prop_revenue_40": prop_revenue_40,
+        "prop_excluded_revenue": prop_excluded_revenue,
+        "prop_operator_fees_czk": prop_operator_fees_czk, "prop_net_czk": prop_net_czk,
+        "group60_revenue": group60_revenue, "group40_revenue": group40_revenue,
+        "revenue": revenue, "flat_expenses_60": flat_expenses_60, "flat_expenses_40": flat_expenses_40,
+        "flat_expenses": flat_expenses, "profit_60": profit_60, "profit_40": profit_40, "profit": profit,
+        "group60_limit_usage_percent": group60_limit_usage_percent,
+        "annual_tax_before_credit": annual_tax_before_credit, "annual_tax_after_credit": annual_tax_after_credit,
+        "employment_tax_withheld": employment_tax_withheld, "income_tax_paid_total": income_tax_paid_total,
+        "income_tax": income_tax_underpayment, "income_tax_underpayment": income_tax_underpayment,
         "income_tax_overpayment": income_tax_overpayment,
         "cssz": q2(cssz), "vzp": vzp, "cssz_threshold": q2(cssz_threshold),
         "cssz_assessment": q2(cssz_assessment), "vzp_assessment": q2(vzp_assessment),
-        "active_months": active_months,
-        "cssz_main_months": cssz_main_months, "cssz_secondary_months": cssz_secondary_months,
-        "vzp_main_months": vzp_main_months, "vzp_secondary_months": vzp_secondary_months,
-        "paid": paid, "payments": payment_rows, "remaining": remaining,
+        "active_months": active_months, "cssz_main_months": cssz_main_months,
+        "cssz_secondary_months": cssz_secondary_months, "vzp_main_months": vzp_main_months,
+        "vzp_secondary_months": vzp_secondary_months,
+        "paid": paid, "payments": payment_rows, "remaining": remaining, "overpayments": overpayments,
         "total_obligation": total_obligation, "total_paid": total_paid,
-        "remaining_total": remaining_total, "after_obligations": after_obligations,
+        "remaining_total": remaining_total, "total_overpayment": total_overpayment,
+        "after_obligations": after_obligations,
+        "forecast_welding_revenue": forecast_welding_revenue,
+        "forecast_prop_revenue": forecast_prop_revenue, "forecast_total": forecast_total,
     }
+
 
 
 @app.route("/settings")
@@ -3242,7 +4215,9 @@ def tax_settings_save():
         if values["revenue_basis"] not in {"paid", "issued"} or values["cssz_mode"] not in allowed_modes or values["vzp_mode"] not in allowed_modes:
             raise ValueError("Nieprawidłowy tryb ustawień.")
         numeric = (
-            "expense_percent", "expense_limit", "income_tax_credit", "employment_tax_base", "employment_tax_withheld", "tax_threshold",
+            "expense_percent", "expense_limit", "expense_40_percent", "expense_40_limit",
+            "forecast_welding_revenue", "forecast_prop_revenue",
+            "income_tax_credit", "employment_tax_base", "employment_tax_withheld", "tax_threshold",
             "cssz_threshold_annual", "cssz_threshold_reduction_month", "cssz_assessment_percent", "cssz_rate_percent",
             "cssz_min_monthly_base", "cssz_secondary_min_monthly_base", "cssz_monthly_advance",
             "vzp_assessment_percent", "vzp_rate_percent", "vzp_min_monthly_base", "vzp_monthly_advance",
@@ -3433,8 +4408,14 @@ def invoice_new() -> str:
 @app.route("/invoices/<int:invoice_id>")
 def invoice_view(invoice_id: int) -> str:
     invoice, items, totals = get_invoice_bundle(invoice_id)
+    linked = get_db().execute(
+        """SELECT p.*, f.name AS firm_name FROM prop_payouts p JOIN prop_firms f ON f.id=p.prop_firm_id WHERE p.linked_invoice_id=?""",
+        (invoice_id,),
+    ).fetchone()
     return render_template("invoice_detail.html", invoice=invoice, items=totals["items"], totals=totals,
-                           company=get_company(), dph_info=invoice_dph_info(invoice, totals), today=date.today().isoformat())
+                           company=get_company(), dph_info=invoice_dph_info(invoice, totals),
+                           linked_payout=dict(linked) if linked else None, today=date.today().isoformat())
+
 
 
 @app.route("/invoices/<int:invoice_id>/edit", methods=["GET", "POST"])
@@ -4087,20 +5068,17 @@ def validate_invoice_database(path: Path) -> tuple[bool, str]:
 @app.route("/tools")
 def tools_page() -> str:
     db = get_db()
-    counts = {"invoices": db.execute("SELECT COUNT(*) AS c FROM invoices").fetchone()["c"],
-              "contractors": db.execute("SELECT COUNT(*) AS c FROM contractors").fetchone()["c"],
-              "expenses": db.execute("SELECT COUNT(*) AS c FROM expenses").fetchone()["c"]}
+    counts = {
+        "invoices": db.execute("SELECT COUNT(*) AS c FROM invoices").fetchone()["c"],
+        "contractors": db.execute("SELECT COUNT(*) AS c FROM contractors").fetchone()["c"],
+        "expenses": db.execute("SELECT COUNT(*) AS c FROM expenses").fetchone()["c"],
+        "prop_firms": db.execute("SELECT COUNT(*) AS c FROM prop_firms").fetchone()["c"],
+        "prop_payouts": db.execute("SELECT COUNT(*) AS c FROM prop_payouts").fetchone()["c"],
+    }
     sequences = db.execute("SELECT year,next_number FROM invoice_sequences ORDER BY year").fetchall()
     next_numbers = ", ".join(f"{row['year']}: {row['next_number']}" for row in sequences) or "1"
-    return render_template(
-        "tools.html",
-        counts=counts,
-        next_numbers=next_numbers,
-        db_path=str(DB_PATH),
-        invoices_path=str(INVOICE_PDF_DIR),
-        remote_db_enabled=REMOTE_DB_ENABLED,
-        remote_bucket=SUPABASE_BUCKET,
-    )
+    return render_template("tools.html", counts=counts, next_numbers=next_numbers, db_path=str(DB_PATH), invoices_path=str(INVOICE_PDF_DIR), remote_db_enabled=REMOTE_DB_ENABLED, remote_bucket=SUPABASE_BUCKET)
+
 
 
 @app.post("/tools/reset-invoices")
@@ -4152,6 +5130,7 @@ def import_database():
         os.replace(temp_path, DB_PATH)
         init_db()
         init_tax_module()
+        init_prop_firms_module()
         contractor_count = get_db().execute("SELECT COUNT(*) AS c FROM contractors").fetchone()["c"]
         backup_note = f" Poprzednia baza: {backup_path.name}." if backup_path else ""
         flash(f"Baza została zaimportowana. Wczytano {contractor_count} kontrahentów.{backup_note}", "success")
@@ -4185,16 +5164,80 @@ def open_browser() -> None:
     webbrowser.open_new("http://127.0.0.1:5000")
 
 
-# V7.1: wykonuj automatyczny backup dopiero po zdefiniowaniu wszystkich funkcji.
+# V8: wykonuj automatyczny backup dopiero po zdefiniowaniu wszystkich funkcji.
 with app.app_context():
     ensure_daily_backup()
 
 
+def run_v8_1_self_tests() -> list[str]:
+    results: list[str] = []
+    grouped = calculate_grouped_percentage_costs(Decimal("2200000"), Decimal("0"), Decimal("60"), Decimal("1200000"), Decimal("40"), Decimal("800000"))
+    assert grouped["flat_expenses_60"] == Decimal("1200000.00")
+    results.append("OK: wspólny limit 60% przy przychodzie 2,2 mln CZK = 1,2 mln CZK")
+
+    invoices = [{"id": 1, "value_czk": Decimal("100000")}, {"id": 2, "value_czk": Decimal("50000")}]
+    remaining = exclude_linked_invoice_rows(invoices, {1})
+    assert [row["id"] for row in remaining] == [2]
+    results.append("OK: faktura powiązana z payoutem jest wyłączona – brak podwójnego przychodu")
+
+    assert date.fromisoformat("2027-01-05").year == 2027
+    results.append("OK: styczniowy payout za grudniową fakturę trafia do roku faktycznego otrzymania")
+
+    payout = payout_amount_breakdown(Decimal("1000"), Decimal("25"), Decimal("975"), Decimal("22"))
+    assert payout["income_czk"] == Decimal("22000.00") and payout["fee_czk"] == Decimal("550.00") and payout["net_czk"] == Decimal("21450.00")
+    results.append("OK: opłata operatora nie pomniejsza przychodu brutto")
+
+    under, over = settlement_balance(Decimal("25023"), Decimal("5200"))
+    assert under == Decimal("19823.00") and over == Decimal("0.00")
+    results.append("OK: zapisane zaliczki są poprawnie odejmowane")
+
+    lucid = payout_amount_breakdown(Decimal("900"), Decimal("18"), Decimal("882"), Decimal("22"))
+    assert lucid["income_czk"] == Decimal("19800.00")
+    assert lucid["fee_czk"] == Decimal("396.00")
+    assert lucid["net_czk"] == Decimal("19404.00")
+    results.append("OK: LucidFlex 1 000 USD wyniku przy 90/10 = 900 USD przychodu przed opłatą")
+
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.executescript("""
+        CREATE TABLE prop_firms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, contractor_id INTEGER,
+            default_tax_classification TEXT, qualification_status TEXT, dph_treatment TEXT,
+            notes TEXT, active INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE prop_payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, prop_firm_id INTEGER, tax_classification TEXT,
+            qualification_status TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    old_id = mem.execute(
+        "INSERT INTO prop_firms (name,default_tax_classification,qualification_status,dph_treatment,notes,active) VALUES (?,?,?,?,?,1)",
+        ("Lucid Trading","s7_60","unconfirmed","review","stara notatka"),
+    ).lastrowid
+    mem.execute(
+        "INSERT INTO prop_payouts (prop_firm_id,tax_classification,qualification_status) VALUES (?,?,?)",
+        (old_id,"s7_60","unconfirmed"),
+    )
+    lucid_id = migrate_lucidflex_profile(mem)
+    migrated = dict(mem.execute("SELECT * FROM prop_firms WHERE id=?", (lucid_id,)).fetchone())
+    migrated_payout = dict(mem.execute("SELECT * FROM prop_payouts").fetchone())
+    assert migrated["name"] == "LucidFlex"
+    assert migrated["qualification_status"] == "recommended"
+    assert migrated_payout["qualification_status"] == "recommended"
+    mem.close()
+    results.append("OK: migracja Lucid Trading → LucidFlex zachowuje payouty i ustawia rekomendowany status")
+    return results
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        for result in run_v8_1_self_tests():
+            print(result)
+        raise SystemExit(0)
     if MIGRATED_FROM:
         print(f"Zaimportowano dane ze starej aplikacji: {MIGRATED_FROM}")
         print(f"Nowa baza danych: {DB_PATH}")
-    print("Faktury OSVČ V7.3 FREE Web/PWA")
+    print("Faktury OSVČ V8.1 Prop Firmy + LucidFlex Web/PWA")
     print(f"Baza danych: {DB_PATH}")
     print(f"Faktury PDF: {INVOICE_PDF_DIR}")
     print(f"Supabase configured: {REMOTE_DB_ENABLED}; bucket={SUPABASE_BUCKET}; key_kind={SUPABASE_KEY_KIND}")
