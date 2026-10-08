@@ -13,9 +13,11 @@ import xml.etree.ElementTree as ET
 def _ensure_dependencies() -> None:
     required = []
     if importlib.util.find_spec("flask") is None:
-        required.append("Flask>=3.0,<4")
+        required.append("Flask>=3.1.3,<4")
     if importlib.util.find_spec("reportlab") is None:
         required.append("reportlab>=4.0,<5")
+    if importlib.util.find_spec("tzdata") is None:
+        required.append("tzdata>=2025.2")
     if not required:
         return
     try:
@@ -34,6 +36,17 @@ def _ensure_dependencies() -> None:
 _ensure_dependencies()
 
 import os
+import tempfile as _test_tempfile
+import atexit as _test_atexit
+if '--self-test' in sys.argv:
+    _v82_test_dir = _test_tempfile.TemporaryDirectory(prefix='faktury_v82_test_')
+    _test_atexit.register(_v82_test_dir.cleanup)
+    for _key in ('RENDER', 'APP_CLOUD_MODE', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'APP_PASSWORD'):
+        os.environ.pop(_key, None)
+    os.environ['INVOICE_APP_DATA'] = _v82_test_dir.name
+    os.environ['INVOICE_APP_DB'] = os.path.join(_v82_test_dir.name, 'self-test.sqlite3')
+    os.environ['INVOICE_PDF_DIR'] = os.path.join(_v82_test_dir.name, 'pdf')
+
 import secrets
 
 # V8: web/PWA z modułem Prop firmy i darmową synchronizacją Supabase.
@@ -1682,6 +1695,58 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 """
 
+
+# V8.2 navigation and forecast templates
+EMBEDDED_TEMPLATES['settings_tabs.html'] = '<nav class="settings-tabs" aria-label="Sekcje ustawień">\n <a class="{% if request.endpoint == \'settings_page\' and settings_tab|default(\'tax\') == \'tax\' %}active{% endif %}" href="{{ url_for(\'settings_page\', year=selected_year|default(snapshot.year if snapshot is defined else current_year), tab=\'tax\') }}">Podatki i składki</a>\n <a class="{% if settings_tab|default(\'\') == \'contractors\' or request.endpoint in [\'contractors_list\',\'contractor_new\',\'contractor_edit\'] %}active{% endif %}" href="{{ url_for(\'contractors_list\') }}">Kontrahenci</a>\n <a class="{% if settings_tab|default(\'\') == \'projects\' or request.endpoint in [\'projects_list\',\'project_new\',\'project_edit\'] %}active{% endif %}" href="{{ url_for(\'projects_list\') }}">Projekty</a>\n <a class="{% if settings_tab|default(\'\') == \'forecast\' %}active{% endif %}" href="{{ url_for(\'settings_page\', year=selected_year|default(snapshot.year if snapshot is defined else current_year), tab=\'forecast\') }}">Prognoza przyszłych składek</a>\n</nav>\n'
+EMBEDDED_TEMPLATES['contribution_forecast.html'] = '<section class="panel contribution-forecast" id="prognoza-skladek">\n <div class="panel-header"><div><div class="eyebrow">PLANOWANIE · {{ forecast.source_year }} → {{ forecast.target_year }}</div><h2>Prognoza zaliczek ČSSZ / VZP na {{ forecast.target_year }}</h2></div><span class="badge badge-warning">Szacunek, nie wezwanie do zapłaty</span></div>\n <p class="muted">Stan otrzymanych środków na {{ forecast.as_of|date_pl }}. Działalność w roku źródłowym: {{ forecast.cssz_main_months }} mies. hlavní + {{ forecast.cssz_secondary_months }} mies. vedlejší. Wynagrodzenie z Accenture nie zwiększa podstawy składek OSVČ.</p>\n <div class="forecast-stats">\n  <div><span>Zapłacone faktury usługowe</span><strong>{{ forecast.welding_revenue|money(\'CZK\') }}</strong></div>\n  <div><span>Otrzymane payouty §7</span><strong>{{ forecast.prop_revenue|money(\'CZK\') }}</strong></div>\n  <div><span>Dochód po kosztach procentowych</span><strong>{{ forecast.actual.profit|money(\'CZK\') }}</strong></div>\n </div>\n {% if forecast.actual.advances %}\n <div class="table-wrap"><table class="forecast-table">\n <thead><tr><th>Etap / wariant</th><th>ČSSZ / mies.</th><th>VZP / mies.</th><th>Razem / mies.</th><th>Zmiana łącznie</th></tr></thead>\n <tbody>\n <tr><td>Bieżące zaliczki zapisane w ustawieniach {{ forecast.source_year }}</td><td>{{ forecast.current_cssz|money(\'CZK\') }}</td><td>{{ forecast.current_vzp|money(\'CZK\') }}</td><td>{{ forecast.current_total|money(\'CZK\') }}</td><td>—</td></tr>\n <tr><td><strong>Od stycznia {{ forecast.target_year }}</strong><small>Dotychczasowy przedpis, nie mniej niż nowe minimum</small></td><td>{{ forecast.january.cssz|money(\'CZK\') }}</td><td>{{ forecast.january.vzp|money(\'CZK\') }}</td><td><strong>{{ forecast.january.total|money(\'CZK\') }}</strong></td><td>{{ forecast.january.difference|money(\'CZK\') }}</td></tr>\n <tr><td><strong>Po Přehledzie: bez kolejnych przychodów</strong><small>Otrzymane do {{ forecast.as_of|date_pl }}; miesiące według pełnego okresu działalności</small></td><td>{{ forecast.actual.advances.cssz|money(\'CZK\') }}</td><td>{{ forecast.actual.advances.vzp|money(\'CZK\') }}</td><td><strong>{{ forecast.actual.advances.total|money(\'CZK\') }}</strong></td><td>{{ forecast.actual.advances.difference|money(\'CZK\') }}</td></tr>\n {% if forecast.has_scenario %}<tr class="scenario-row"><td><strong>Po Přehledzie: Twój scenariusz</strong><small>Dodatkowe wpływy {{ forecast.simulated.additional|money(\'CZK\') }}; łącznie {{ forecast.simulated.revenue|money(\'CZK\') }} przychodu</small></td><td>{{ forecast.simulated.advances.cssz|money(\'CZK\') }}</td><td>{{ forecast.simulated.advances.vzp|money(\'CZK\') }}</td><td><strong>{{ forecast.simulated.advances.total|money(\'CZK\') }}</strong></td><td>{{ forecast.simulated.advances.difference|money(\'CZK\') }}</td></tr>{% endif %}\n </tbody></table></div>\n <p><strong>Kiedy zmiana po rozliczeniu?</strong> ČSSZ: od miesiąca następującego po miesiącu, w którym złożysz lub powinieneś złożyć Přehled. VZP: już za miesiąc złożenia lub wymaganej daty złożenia. Podwyżka minimum obowiązuje wcześniej, od stycznia.</p>\n <details class="forecast-details"><summary>Wzory, założenia i jakość danych</summary>\n <p>ČSSZ: 55% dochodu §7 ÷ {{ forecast.cssz_months }} mies.; następnie 29,2%, minimum i maksimum oraz zaokrąglenia w górę. VZP: 50% dochodu §7 ÷ {{ forecast.vzp_months }} mies. × 13,5%, z minimum i zaokrągleniem w górę. Przy zmienionych ręcznie stawkach używane są parametry z ustawień.</p>\n <p>Wpłacone zaliczki zmniejszają rozliczenie roczne, ale nie obniżają wysokości zaliczek na następny rok. Nie dzielimy wyniku przez 12, jeżeli działalność trwała tylko część roku.</p>\n <p>{{ forecast.parameters.source_note }}</p>\n {% if forecast.parameters.status == \'manual\' %}<p class="callout warning">Parametry roku docelowego wprowadzono ręcznie. Sprawdź ich zgodność z przepisami.</p>{% endif %}\n <p>Źródła: <a href="https://www.zakonyprolidi.cz/cs/2026-177" target="_blank" rel="noopener noreferrer">NV 177/2026 Sb.</a> · <a href="https://www.cssz.gov.cz/zalohy-na-pojistne-na-duchodove-pojisteni" target="_blank" rel="noopener noreferrer">ČSSZ — zaliczki</a> · <a href="https://www.vzp.cz/platci/informace/osvc/zalohy-na-pojistne/vypocet-zaloh-na-pojistne" target="_blank" rel="noopener noreferrer">VZP — zaliczki</a></p>\n </details>\n {% else %}<div class="callout warning">Brak liczby miesięcy działalności lub parametrów roku docelowego. Uzupełnij ustawienia prognozy. Nie pokazujemy zgadywanych stawek.</div>{% endif %}\n {% if forecast.warnings %}<div class="callout warning"><strong>Ważne dla tej prognozy:</strong><ul class="compact-list">{% for w in forecast.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>{% endif %}\n {% if forecast.pending %}<details class="forecast-details"><summary>Nieopłacone faktury — wyłączone z otrzymanych przychodów ({{ forecast.pending|length }})</summary>\n <div class="table-wrap"><table><thead><tr><th>Numer</th><th>Kwota</th><th>Wartość CZK (pomocniczo)</th></tr></thead><tbody>{% for p in forecast.pending %}<tr><td><a href="{{ url_for(\'invoice_view\', invoice_id=p.id) }}">{{ p.number }}</a></td><td>{{ p.amount|money(p.currency) }}</td><td>{{ p.value_czk|money(\'CZK\') if p.value_czk is not none else \'Brak kursu – do uzupełnienia\' }}</td></tr>{% endfor %}</tbody></table></div>\n <p class="muted">Nie są automatycznie doliczane do scenariusza. Oczekiwane wpływy możesz sam wpisać w ustawieniach prognozy.</p></details>{% endif %}\n <a class="btn btn-light" href="{{ url_for(\'settings_page\', year=forecast.source_year, tab=\'forecast\') }}">Zmień założenia prognozy</a>\n</section>\n'
+EMBEDDED_TEMPLATES['forecast_settings.html'] = '<section class="panel">\n <div class="panel-header"><h2>Założenia prognozy {{ forecast.source_year }} → {{ forecast.target_year }}</h2></div>\n <p>Prognoza nie zmienia faktur, payoutów, zapisanych wpłat ani podstawy rozliczenia. Liczy opłacone przychody niezależnie od trybu „według wystawienia” w kalkulatorze.</p>\n <form method="post" action="{{ url_for(\'contribution_forecast_save\') }}" class="form-panel">\n <input type="hidden" name="source_year" value="{{ forecast.source_year }}">\n <div class="form-grid three">\n <label class="field"><span>Stan na dzień (puste = dzisiaj)</span><input type="date" name="as_of_date" value="{{ forecast.options.as_of_date }}" min="{{ forecast.source_year }}-01-01" max="{{ forecast.source_year }}-12-31"></label>\n <label class="field"><span>Dodatkowe wpływy do końca roku — grupa 60%, CZK</span><input type="number" name="additional_revenue_60" step="0.01" min="0" value="{{ forecast.options.additional_revenue_60 }}"><small>Tylko wpływy jeszcze nieotrzymane na dzień zestawienia; wspólnie spawanie i prop firmy 60%.</small></label>\n <label class="field"><span>Dodatkowe wpływy do końca roku — grupa 40%, CZK</span><input type="number" name="additional_revenue_40" step="0.01" min="0" value="{{ forecast.options.additional_revenue_40 }}"><small>Bez challenge i opłat — nie są dodatkowymi kosztami przy paušálu.</small></label>\n </div>\n <details class="forecast-details"><summary>Zaawansowane: miesiące, wyjątki i notatka</summary>\n <p class="muted">Domyślnie kontynuacja hlavní. Nie zaznaczaj zwolnień tylko dlatego, że działalność ponownie rozpoczęła się w 2026. Wcześniejsza działalność może wykluczać ulgę.</p>\n <div class="form-grid two">\n <label class="field"><span>Miesiące dla ČSSZ (0 = automatycznie {{ forecast.cssz_main_months + forecast.cssz_secondary_months }})</span><input type="number" min="0" max="12" name="cssz_months_override" value="{{ forecast.options.cssz_months_override }}"><small>Uwzględnij wszystkie miesiące hlavní i vedlejší z poprzedniego roku; nie tylko główne.</small></label>\n <label class="field"><span>Miesiące dla VZP (0 = automatycznie)</span><input type="number" min="0" max="12" name="vzp_months_override" value="{{ forecast.options.vzp_months_override }}"><small>Zmień tylko na podstawie właściwego Přehledu i rzeczywistego okresu.</small></label>\n <label class="checkbox-row"><input type="checkbox" name="cssz_advance_exempt" value="1" {% if forecast.options.cssz_advance_exempt %}checked{% endif %}> Potwierdzone zwolnienie z zaliczek ČSSZ</label>\n <label class="checkbox-row"><input type="checkbox" name="vzp_advance_exempt" value="1" {% if forecast.options.vzp_advance_exempt %}checked{% endif %}> Potwierdzone zwolnienie z zaliczek VZP</label>\n <label class="checkbox-row"><input type="checkbox" name="vzp_minimum_applies" value="1" {% if forecast.options.vzp_minimum_applies %}checked{% endif %}> Obowiązuje minimalna podstawa VZP</label>\n <label class="field span-2"><span>Notatka / podstawa wyjątku</span><textarea name="note" rows="2">{{ forecast.options.note }}</textarea></label>\n </div></details>\n <div class="form-actions"><button class="btn btn-primary" type="submit">Zapisz scenariusz</button><a class="btn btn-light" href="{{ url_for(\'taxes_dashboard\', year=forecast.source_year) }}#prognoza-skladek">Pokaż prognozę</a></div>\n </form>\n</section>\n<section class="panel">\n <h2>Parametry składek na {{ forecast.target_year }}</h2>\n <p class="muted">Przechowywane osobno według roku. Nie zastępują Twoich obecnych zaliczek ani historycznych ustawień podatku. Obecny model zakłada hlavní; indywidualny předpis może być wyższy.</p>\n {% set fp = forecast.parameters or {} %}\n <p>{{ fp.get(\'source_note\', \'Brak zweryfikowanych parametrów. Wpisz je z oficjalnego źródła.\') }}</p>\n <details class="forecast-details"><summary>Edytuj parametry roku docelowego</summary>\n <form method="post" action="{{ url_for(\'contribution_parameters_save\') }}" class="form-panel">\n <input type="hidden" name="target_year" value="{{ forecast.target_year }}">\n <div class="form-grid three">\n {% for key,label in [(\'cssz_min_base\',\'Minimalna podstawa miesięczna ČSSZ\'),(\'cssz_max_base\',\'Maksymalna podstawa miesięczna ČSSZ\'),(\'vzp_min_base\',\'Minimalna podstawa miesięczna VZP\'),(\'cssz_assessment_percent\',\'ČSSZ: procent dochodu\'),(\'cssz_rate_percent\',\'ČSSZ: stawka procentowa\'),(\'vzp_assessment_percent\',\'VZP: procent dochodu\'),(\'vzp_rate_percent\',\'VZP: stawka procentowa\')] %}\n <label class="field"><span>{{ label }}</span><input type="number" step="0.01" min="0" name="{{ key }}" value="{{ fp.get(key,\'\') }}" required></label>\n {% endfor %}\n <label class="field span-3"><span>Źródło / uzasadnienie parametrów</span><textarea name="source_note" rows="2">{{ fp.get(\'source_note\',\'\') }}</textarea></label>\n </div><div class="form-actions"><button class="btn btn-primary" type="submit">Zapisz parametry {{ forecast.target_year }}</button></div>\n </form></details>\n</section>\n{% include \'contribution_forecast.html\' %}\n'
+EMBEDDED_TEMPLATES['base.html'] = EMBEDDED_TEMPLATES['base.html'].replace('<a href="{{ url_for(\'contractors_list\') }}">Kontrahenci</a>', '')
+EMBEDDED_TEMPLATES['base.html'] = EMBEDDED_TEMPLATES['base.html'].replace('<a href="{{ url_for(\'projects_list\') }}">Projekty</a>', '')
+
+_settings_tax_v82 = EMBEDDED_TEMPLATES['settings.html']
+_settings_tax_v82 = _settings_tax_v82.replace('{% block content %}', "{% block content %}{% include 'settings_tabs.html' %}{% if settings_tab == 'forecast' %}<div class=\"page-header\"><div><h1>Ustawienia prognozy składek</h1><p class=\"muted\">Wybrany rok źródłowy: {{ snapshot.year }}</p></div></div>{% include 'forecast_settings.html' %}{% else %}", 1)
+_settings_tax_v82 = _settings_tax_v82.replace('{% endblock %}', '{% endif %}{% endblock %}', 1) if False else _settings_tax_v82
+# Close the conditional only at the END of the content block, not at the title.
+_pos = _settings_tax_v82.rfind('{% endblock %}')
+_settings_tax_v82 = _settings_tax_v82[:_pos] + '{% endif %}' + _settings_tax_v82[_pos:]
+EMBEDDED_TEMPLATES['settings.html'] = _settings_tax_v82
+for _name in ('contractors_list.html','contractor_form.html','projects_list.html','project_form.html'):
+    if _name in EMBEDDED_TEMPLATES:
+        EMBEDDED_TEMPLATES[_name] = EMBEDDED_TEMPLATES[_name].replace(
+            '{% block content %}', "{% block content %}<div class=\"settings-context\">Ustawienia / zarządzanie danymi</div>{% include 'settings_tabs.html' %}", 1)
+EMBEDDED_TEMPLATES['taxes_dashboard.html'] = EMBEDDED_TEMPLATES['taxes_dashboard.html'].replace(
+    '{% if snapshot.forecast_total > 0 %}', "{% include 'contribution_forecast.html' %}\\n{% if snapshot.forecast_total > 0 %}", 1)
+EMBEDDED_TEMPLATES['taxes_dashboard.html'] = EMBEDDED_TEMPLATES['taxes_dashboard.html'].replace(
+    'Rzeczywiście otrzymane przychody, procentowe koszty, podatek, ČSSZ i VZP.',
+    "Przychody {{ 'według zapłaty' if snapshot.settings.revenue_basis == 'paid' else 'według wystawienia (wariant prognozowy)' }}, podatek, ČSSZ i VZP.")
+EMBEDDED_TEMPLATES['taxes_dashboard.html'] = EMBEDDED_TEMPLATES['taxes_dashboard.html'].replace(
+    '<h2>Minimalne miesięczne zaliczki</h2>', '<h2>Bieżące miesięczne zaliczki z ustawień</h2>')
+EMBEDDED_CSS += r"""
+.contribution-forecast{scroll-margin-top:95px}
+.settings-tabs{display:flex;gap:8px;flex-wrap:wrap;padding:8px;background:#fff;border:1px solid #dfe4eb;border-radius:14px;margin-bottom:24px}
+.settings-tabs a{padding:11px 15px;text-decoration:none;border-radius:9px;color:#334155;font-weight:600}
+.settings-tabs a.active{background:#84183c;color:white}.settings-tabs a:hover{background:#f1e7ec;color:#761333}
+.settings-context{font-size:13px;color:#64748b;margin-bottom:9px}.eyebrow{font-size:11px;letter-spacing:.09em;font-weight:800;color:#7a2042;margin-bottom:8px}
+.forecast-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:18px 0}
+.forecast-stats>div{padding:15px;border:1px solid #e2e8f0;background:#fafbfd;border-radius:10px}.forecast-stats span{display:block;color:#64748b;font-size:12px}.forecast-stats strong{display:block;font-size:22px;margin-top:6px}
+.forecast-details{margin:15px 0}.forecast-details summary{cursor:pointer;font-weight:700;color:#59263c;padding:7px 0}
+.forecast-table td small{display:block;max-width:380px;color:#64748b;margin-top:4px}.scenario-row{background:#fcf5ea}
+@media(max-width:900px){.settings-tabs{display:grid;grid-template-columns:1fr 1fr;gap:4px}.settings-tabs a{padding:10px;font-size:13px}.forecast-stats{grid-template-columns:1fr}.forecast-table{min-width:740px}}
+"""
+EMBEDDED_TEMPLATES['settings.html'] = EMBEDDED_TEMPLATES['settings.html'].replace('<p class="muted">Wybrany rok źródłowy: {{ snapshot.year }}</p></div></div>', '<p class="muted">Wybrany rok źródłowy: {{ snapshot.year }}</p></div><form class="toolbar year-toolbar" method="get"><input type="hidden" name="tab" value="forecast"><input type="number" name="year" min="2020" max="2099" value="{{ snapshot.year }}"><button class="btn btn-light" type="submit">Pokaż rok</button></form></div>', 1)
+
+
+# V8.3 UI: independent rate sources for invoice and cash receipt.
+EMBEDDED_TEMPLATES['fx_controls.html'] = '<div class="fx-controls span-3" data-fx-currency="{{ fx_currency_id }}" data-fx-rate="{{ fx_rate_id }}" data-fx-business-date="{{ fx_business_date }}" data-fx-kind="{{ fx_kind }}" data-fx-endpoint="{{ url_for(\'cnb_rate_api\') }}">\n  <div class="form-grid three">\n    <label class="field"><span>Źródło kursu</span><select name="fx_mode" class="fx-mode">\n      {% set mode = fx_form_mode(fx_is_edit) %}\n      {% if fx_is_edit %}<option value="keep" {% if mode == \'keep\' %}selected{% endif %}>Zachowaj zapisany kurs</option>{% endif %}\n      <option value="cnb" {% if mode == \'cnb\' %}selected{% endif %}>Automatycznie — dzienny kurs ČNB</option>\n      <option value="manual" {% if mode == \'manual\' %}selected{% endif %}>Wpisz kurs ręcznie</option>\n    </select></label>\n    <label class="field"><span>{{ \'Data kursu faktury / DPH\' if fx_kind == \'invoice\' else \'Data kursu przychodu\' }}</span><input class="fx-date" type="date" name="fx_date" value="{{ request.form.get(\'fx_date\', fx_date_value) }}" {% if fx_kind != \'invoice\' %}readonly{% endif %} required>\n      <small>{{ \'Domyślnie data wykonania usługi. Zmień, gdy właściwe rozliczenie wymaga innej daty.\' if fx_kind == \'invoice\' else \'Ta sama data co otrzymanie dostępnych środków.\' }}</small></label>\n    <div class="field"><span>&nbsp;</span><button type="button" class="btn btn-light fx-fetch">Pobierz kurs ČNB</button></div>\n  </div>\n  <p class="fx-message" role="status" aria-live="polite">{{ \'Zapisany kurs zostaje bez zmian.\' if fx_is_edit else \'Wybierz walutę i datę.\' }}</p>\n  <small class="muted">Kurs oznacza CZK za 1 jednostkę waluty. To kurs dzienny, nie roczny „jednotný kurz”. Nie pobieramy wyceny USDT/USDC z tabeli USD.</small>\n</div>\n'
+EMBEDDED_TEMPLATES['fx_settings.html'] = '{% extends \'base.html\' %}\n{% block title %}Kursy walut — Faktury OSVČ{% endblock %}\n{% block content %}\n{% include \'settings_tabs.html\' %}\n<div class="page-header"><div><h1>Kursy walut</h1><p class="muted">Dzienny kurs ČNB; osobna wycena dokumentu i otrzymanej zapłaty.</p></div></div>\n<section class="panel">\n<form method="post">\n<label class="checkbox-row"><input type="checkbox" name="default_auto" value="1" {% if default_auto %}checked{% endif %}> Automatycznie pobieraj kurs ČNB w nowych fakturach, wypłatach i płatnościach</label>\n<p>Na starych dokumentach domyślnie zachowywany jest zapisany kurs. Pobranie nowej tabeli nie zmienia kursów innych faktur ani ustawień podatkowych.</p>\n<button class="btn btn-primary" type="submit">Zapisz ustawienie</button>\n</form>\n</section>\n<section class="panel"><h2>Jak działa przeliczenie</h2>\n<p><strong>Faktura / DPH:</strong> domyślnie pobierany jest kurs na dzień wykonania usługi. Data może być zmieniona, jeśli właściwe zasady dla transakcji wymagają innego dnia. Wystawienie faktury w EUR nadal oznacza należność w EUR.</p>\n<p><strong>Przychód według zapłaty:</strong> osobny kurs z daty otrzymania pieniędzy zapiszesz w „Data i kurs zapłaty”. Nie zmienia on kursu używanego dla DPH. Przy powiązanym payoucie źródłem przychodu jest payout, nie druga wpłata.</p>\n<p><strong>Starsze płatności:</strong> bez osobnego kursu przychodu pozostawiamy wcześniejsze wyliczenie i ostrzeżenie. Uzupełnij datę oraz kurs, zamiast automatycznie przeliczać historię.</p>\n<p><strong>Publikacja ČNB:</strong> około 14:30 w czeskie dni robocze. Weekend i święto korzystają z tabeli obowiązującej na dany dzień. Brak dzisiejszej tabeli albo awaria nie oznaczają zgody na losowy kurs z innego dnia.</p>\n<p><strong>Jednotný kurz:</strong> dzienny kurs nie jest rocznym kursem podatkowym. Ta aktualizacja nie zmienia samodzielnie Twojej rocznej metody rozliczenia; stosuj wybraną metodę spójnie. Roczny jednotný kurz nie jest automatycznie wyliczany ani stosowany przez ten moduł.</p>\n<p><strong>Tokeny:</strong> dla USDT, USDC i innych kryptoaktywów wpisz udokumentowaną wycenę ręcznie. Jeżeli dokument źródłowy określa przychód rzeczywiście w USD, ewidencjonuj walutę tego przychodu zgodnie z dokumentem.</p>\n<p class="muted">Dane kursowe pochodzą wyłącznie z oficjalnego serwisu www.cnb.cz. Nie jest wymagany płatny abonament ani klucz API. Rozpoznanie obowiązku DPH pozostaje osobną decyzją.</p>\n</section>\n{% endblock %}\n'
+EMBEDDED_TEMPLATES['invoice_payment.html'] = '{% extends \'base.html\' %}\n{% block title %}Data i kurs zapłaty — {{ invoice.invoice_number }}{% endblock %}\n{% block content %}\n<div class="page-header"><div><h1>Data i kurs zapłaty</h1><p class="muted">{{ invoice.invoice_number }} · {{ invoice.contractor_name }} · {{ totals.total_gross|money(invoice.currency) }}</p></div></div>\n<div class="callout info">Zapis dotyczy pełnej zapłaty faktury, a nie zaliczki ani częściowej płatności. Kurs otrzymanego przychodu jest oddzielny od kursu faktury / DPH.</div>\n<form method="post" class="panel form-panel">\n<div class="form-grid three">\n<label class="field"><span>Data otrzymania pieniędzy</span><input type="date" name="paid_date" value="{{ paid_date }}" required></label>\n<label class="field"><span>Waluta</span><input id="payment-currency" value="{{ invoice.currency }}" readonly></label>\n<label class="field"><span>Kurs zapłaty: CZK za 1 jednostkę</span><input id="payment-rate" name="czk_rate" type="number" step="any" min="0" value="{{ rate }}"></label>\n{% set fx_currency_id = \'payment-currency\' %}{% set fx_rate_id = \'payment-rate\' %}{% set fx_kind = \'payment\' %}{% set fx_business_date = \'paid_date\' %}{% set fx_is_edit = is_edit %}{% set fx_date_value = paid_date %}\n{% include \'fx_controls.html\' %}\n</div>\n<div class="form-actions"><a href="{{ url_for(\'invoice_view\',invoice_id=invoice.id) }}" class="btn btn-light">Anuluj</a><button class="btn btn-primary" type="submit">Zapisz zapłatę i kurs</button></div>\n</form>\n{% endblock %}\n'
+EMBEDDED_TEMPLATES['invoice_form.html'] = '{% extends "base.html" %}\n{% block title %}{{ \'Edytuj fakturę\' if is_edit else \'Nowa faktura\' }} - Faktury OSVČ{% endblock %}\n{% block content %}\n<div class="page-header">\n    <div><h1>{{ \'Edytuj fakturę \' ~ invoice.invoice_number if is_edit else \'Nowa faktura\' }}</h1><p class="muted">PDF zostanie wygenerowany w formacie A4.</p></div>\n</div>\n{% if not contractors %}<div class="callout warning"><strong>Najpierw dodaj kontrahenta.</strong> <a href="{{ url_for(\'contractor_new\') }}">Dodaj teraz</a>.</div>{% endif %}\n<form method="post" class="panel form-panel invoice-form" data-default-due-days="{{ company.default_due_days }}">\n    <h2>Dane dokumentu</h2>\n    <div class="form-grid three">\n        <label class="field span-2"><span>Kontrahent *</span><select id="contractor-select" name="contractor_id" required><option value="">-- wybierz --</option>{% for contractor in contractors %}<option value="{{ contractor.id }}" data-vat="{{ contractor.vat_id }}" data-country="{{ contractor.country }}" {% if invoice.contractor_id|string == contractor.id|string %}selected{% endif %}>{{ contractor.name }}{% if contractor.vat_id %} ({{ contractor.vat_id }}){% endif %}</option>{% endfor %}</select></label>\n        <div class="field field-button"><span>&nbsp;</span><a class="btn btn-light" href="{{ url_for(\'contractor_new\') }}">+ Nowy kontrahent</a></div>\n        <label class="field"><span>Data wystawienia *</span><input id="issue-date" type="date" name="issue_date" value="{{ invoice.issue_date }}" required></label>\n        <label class="field"><span>Data wykonania usługi *</span><input type="date" name="supply_date" value="{{ invoice.supply_date }}" required></label>\n        <label class="field"><span>Termin płatności *</span><input id="due-date" type="date" name="due_date" value="{{ invoice.due_date }}" required></label>\n        <label class="field"><span>Waluta</span><input id="invoice-currency" name="currency" value="{{ invoice.currency }}" maxlength="6" list="currency-list"><datalist id="currency-list"><option value="EUR"><option value="CZK"><option value="PLN"><option value="USD"></datalist></label>\n        <label class="field"><span>Kurs faktury / DPH do CZK</span><input id="czk-rate" type="number" step="any" min="0" name="czk_rate" value="{{ invoice.czk_rate }}" placeholder="np. 24,85"><small>1 jednostka waluty faktury = ... CZK</small></label>\n        <label class="field"><span>Język PDF</span><select name="language">{% for code, label in LANGUAGES.items() %}<option value="{{ code }}" {% if invoice.language == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>\n        <label class="field"><span>Tryb VAT</span><select id="tax-mode" name="tax_mode">{% for code, label in TAX_MODES.items() %}<option value="{{ code }}" {% if invoice.tax_mode == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>\n        <label class="field span-2"><span>Klasyfikacja DPH / VIES</span><select id="dph-category" name="dph_category">{% for code, label in DPH_CATEGORIES.items() %}<option value="{{ code }}" {% if invoice.dph_category == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>\n        <label class="field"><span>Sposób płatności</span><select name="payment_method">{% for code, label in PAYMENT_METHODS.items() %}<option value="{{ code }}" {% if invoice.payment_method == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>\n        <label class="field"><span>Projekt</span>\n            <select id="project-select">\n                <option value="">— wybierz zapisany projekt —</option>\n                {% for project in projects %}\n                <option value="{{ project.project_number }}" data-contractor="{{ project.contractor_id or \'\' }}" {% if invoice.order_number == project.project_number %}selected{% endif %}>{{ project.project_number }}{% if project.project_name %} — {{ project.project_name }}{% endif %}</option>\n                {% endfor %}\n            </select>\n            <small>Lista filtruje się po wybranym kontrahencie.</small>\n        </label>\n        <label class="field"><span>Numer projektu / zamówienia</span><input id="order-number" name="order_number" value="{{ invoice.order_number }}" placeholder="Wybierz projekt lub wpisz ręcznie"></label>\n        <label class="field"><span>Symbol / referencja płatności</span><input name="variable_symbol" value="{{ invoice.variable_symbol }}" placeholder="Wygeneruje się automatycznie"></label>\n    </div>\n    {% set fx_currency_id = \'invoice-currency\' %}{% set fx_rate_id = \'czk-rate\' %}{% set fx_kind = \'invoice\' %}{% set fx_business_date = \'supply_date\' %}{% set fx_is_edit = is_edit %}\n    {% set q = fx_quote(\'invoice\',invoice.id,\'document\') %}\n    {% set fx_date_value = q.requested_date if q else invoice.supply_date %}\n    {% include \'fx_controls.html\' %}\n    <div id="dph-hint" class="callout info dph-hint">Program sprawdzi VAT ID kontrahenta i tryb faktury.</div>\n    <p class="small muted">Automatyczna klasyfikacja jest podpowiedzią. Dla usług związanych z nieruchomością lub budową, zaliczek, korekt oraz nietypowych transakcji wybierz „Do ręcznego sprawdzenia”.</p>\n\n    <hr>\n    <div class="panel-header"><h2>Pozycje faktury</h2><button id="add-item" class="btn btn-light btn-small" type="button">+ Dodaj pozycję</button></div>\n    <div class="table-wrap invoice-items-wrap">\n        <table class="invoice-items">\n            <thead><tr><th>Opis</th><th>Ilość</th><th>Jedn.</th><th>Cena jedn.</th><th class="vat-column">VAT %</th><th>Wartość</th><th></th></tr></thead>\n            <tbody id="invoice-items-body">\n                {% for item in items %}\n                <tr class="invoice-item-row">\n                    <td><input name="item_description" value="{{ item.description }}" placeholder="Opis usługi" required></td>\n                    <td><input class="qty-input" type="number" step="0.01" min="0.01" name="item_quantity" value="{{ item.quantity }}" required></td>\n                    <td><input name="item_unit" value="{{ item.unit }}" placeholder="h"></td>\n                    <td><input class="price-input" type="number" step="0.01" min="0" name="item_unit_price" value="{{ item.unit_price }}" required></td>\n                    <td class="vat-column"><input class="vat-input" type="number" step="0.01" min="0" max="100" name="item_vat_rate" value="{{ item.vat_rate or 0 }}"></td>\n                    <td class="line-total">0.00</td>\n                    <td><button class="icon-button remove-item" type="button" title="Usuń pozycję">×</button></td>\n                </tr>\n                {% endfor %}\n            </tbody>\n            <tfoot><tr><td colspan="5" class="total-label">Razem</td><td id="invoice-total">0.00 {{ invoice.currency }}</td><td></td></tr></tfoot>\n        </table>\n    </div>\n\n    <div id="reverse-charge-section" class="form-grid one"><label class="field"><span>Adnotacja reverse charge</span><textarea name="reverse_charge_note" rows="3">{{ invoice.reverse_charge_note }}</textarea></label></div>\n    <label class="field"><span>Uwagi na fakturze</span><textarea name="notes" rows="4">{{ invoice.notes }}</textarea></label>\n    <div class="form-actions"><a class="btn btn-ghost" href="{{ url_for(\'invoices_list\') }}">Anuluj</a><button class="btn btn-primary" type="submit" {% if not contractors %}disabled{% endif %}>{{ \'Zapisz zmiany\' if is_edit else \'Wystaw fakturę\' }}</button></div>\n</form>\n\n<template id="invoice-item-template"><tr class="invoice-item-row"><td><input name="item_description" placeholder="Opis usługi" required></td><td><input class="qty-input" type="number" step="0.01" min="0.01" name="item_quantity" value="1" required></td><td><input name="item_unit" value="h"></td><td><input class="price-input" type="number" step="0.01" min="0" name="item_unit_price" required></td><td class="vat-column"><input class="vat-input" type="number" step="0.01" min="0" max="100" name="item_vat_rate" value="0"></td><td class="line-total">0.00</td><td><button class="icon-button remove-item" type="button">×</button></td></tr></template>\n{% endblock %}\n'
+EMBEDDED_TEMPLATES['prop_payout_form.html'] = '{% extends "base.html" %}\n{% block title %}{{ \'Edytuj payout\' if is_edit else \'Nowy payout\' }} - Faktury OSVČ{% endblock %}\n{% block content %}\n<div class="page-header"><div><h1>{{ \'Edytuj payout\' if is_edit else \'Nowy payout\' }}</h1><p class="muted">Wpisuj kwotę należną Tobie po profit split, przed opłatą operatora.</p></div></div>\n<form method="post" class="panel form-panel" id="prop-payout-form" data-is-edit="{{ 1 if is_edit else 0 }}">\n<div class="form-grid three">\n  <label class="field"><span>Firma *</span><select name="prop_firm_id" id="prop-firm-select" required>{% for f in firms %}<option value="{{ f.id }}" data-contractor="{{ f.contractor_id or \'\' }}" data-tax="{{ f.default_tax_classification }}" data-status="{{ f.qualification_status }}" data-dph="{{ f.dph_treatment }}" data-name="{{ f.name|e }}" data-notes="{{ f.notes|e }}" {% if payout.prop_firm_id|string == f.id|string %}selected{% endif %}>{{ f.name }}</option>{% endfor %}</select></label>\n  <label class="field"><span>Konto / identyfikator payoutu</span><input name="payout_identifier" value="{{ payout.payout_identifier }}" placeholder="np. account ID / payout #"></label>\n  <label class="field"><span>Data otrzymania dostępnych środków *</span><input type="date" name="received_date" value="{{ payout.received_date }}" required><small>Data na Rise/WorkMarket/wallecie, nie późniejszy przelew na własny bank.</small></label>\n  <div id="prop-firm-profile-note" class="callout info span-3" hidden></div>\n\n  <label class="field"><span>Waluta *</span><input id="payout-currency" name="currency" value="{{ payout.currency }}" maxlength="8" required placeholder="USD, EUR, USDT"></label>\n  <label class="field"><span>Kwota należna po profit split *</span><input id="payout-gross" type="number" step="0.00000001" min="0" name="gross_amount" value="{{ payout.gross_amount }}" required><small>Nie wpisuj wirtualnego wyniku rachunku. LucidFlex: 1 000 USD wyniku przy 90/10 → wpisz 900 USD.</small></label>\n  <label class="field"><span>Opłata operatora</span><input id="payout-fee" type="number" step="0.00000001" min="0" name="operator_fee" value="{{ payout.operator_fee }}"></label>\n\n  <label class="field"><span>Kwota otrzymana netto *</span><input id="payout-net" type="number" step="0.00000001" min="0" name="net_amount" value="{{ payout.net_amount }}" required><small>Informacyjnie; nie pomniejsza przychodu przy kosztach procentowych.</small></label>\n  <label class="field"><span>Kurs 1 jednostki waluty do CZK *</span><input id="payout-rate" type="number" step="0.000001" min="0.000001" name="czk_rate" value="{{ payout.czk_rate }}" required></label>\n  <label class="field"><span>Przychód w CZK</span><input id="payout-income-czk" value="{{ payout.income_czk }}" readonly><small>Kwota po split × kurs; przed opłatą operatora.</small></label>\n\n  <label class="field span-2"><span>Powiązana faktura</span><select name="linked_invoice_id" id="prop-invoice-select"><option value="">— bez faktury —</option>{% for inv in invoices %}<option value="{{ inv.id }}" data-contractor="{{ inv.contractor_id }}" {% if payout.linked_invoice_id|string == inv.id|string %}selected{% endif %}>{{ inv.invoice_number }} — {{ inv.contractor_name }} — {{ inv.total|money(inv.currency) }} — {{ inv.supply_date|date_pl }}</option>{% endfor %}</select><small>Powiązana faktura i payout są jednym przychodem. Faktura nie zostanie doliczona drugi raz.</small></label>\n  <div class="field"><span>&nbsp;</span><a class="btn btn-light" href="{{ url_for(\'invoice_new\') }}">Wystaw nową fakturę</a></div>\n\n  <label class="field"><span>Kwalifikacja PIT</span><select name="tax_classification" id="prop-tax-classification">{% for code,label in PROP_TAX_CLASSIFICATIONS.items() %}<option value="{{ code }}" {% if payout.tax_classification == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>\n  <label class="field"><span>Status kwalifikacji</span><select name="qualification_status" id="prop-qualification-status">{% for code,label in PROP_QUALIFICATION_STATUSES.items() %}<option value="{{ code }}" {% if payout.qualification_status == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>\n  <label class="field"><span>DPH – osobna kwalifikacja</span><select name="dph_treatment" id="prop-dph-treatment">{% for code,label in PROP_DPH_TREATMENTS.items() %}<option value="{{ code }}" {% if payout.dph_treatment == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>\n  {% set fx_currency_id = \'payout-currency\' %}{% set fx_rate_id = \'payout-rate\' %}{% set fx_kind = \'payout\' %}{% set fx_business_date = \'received_date\' %}{% set fx_is_edit = is_edit %}{% set fx_date_value = payout.received_date %}\n  {% include \'fx_controls.html\' %}\n  <label class="field span-3"><span>Notatka</span><textarea name="notes" rows="4">{{ payout.notes }}</textarea></label>\n</div>\n<div class="callout warning"><strong>Ważne:</strong> opłata operatora, challenge fee oraz składki ČSSZ/VZP nie są dodatkowo odejmowane, gdy dla tej grupy stosujesz koszty procentowe. Dla konta live nie używaj automatycznie profilu LucidFlex – najpierw przeanalizuj nową umowę i ustaw rozliczenie ręczne lub oddzielną firmę.</div>\n<div class="form-actions"><button class="btn btn-primary" type="submit">Zapisz payout</button><a class="btn btn-ghost" href="{{ url_for(\'prop_firms_dashboard\') }}">Anuluj</a></div>\n</form>\n{% if is_edit %}<div class="danger-zone"><span></span><form method="post" action="{{ url_for(\'prop_payout_delete\', payout_id=payout.id) }}" onsubmit="return confirm(\'Usunąć ten payout?\')"><button class="btn btn-danger" type="submit">Usuń payout</button></form></div>{% endif %}\n{% endblock %}\n'
+EMBEDDED_TEMPLATES['invoice_detail.html'] = '{% extends "base.html" %}\n{% block title %}{{ invoice.invoice_number }} - Faktury OSVČ{% endblock %}\n{% block content %}\n<div class="page-header"><div><h1>{{ invoice.invoice_number }}</h1><p class="muted">{{ invoice.contractor_name }} · {{ invoice.issue_date|date_pl }}</p></div><div class="button-row"><a class="btn btn-primary" href="{{ url_for(\'invoice_pdf\', invoice_id=invoice.id) }}">Pobierz PDF A4</a><a class="btn btn-light" href="{{ url_for(\'invoice_edit\', invoice_id=invoice.id) }}">Edytuj</a></div></div>\n{% if dph_info.kind == \'eu_service\' %}<div class="callout info"><strong>DPH / UE:</strong> ta faktura zostanie ujęta w Souhrnné hlášení za {{ dph_info.period_label }} z kodem plnění 3. Podstawowy termin: {{ dph_info.due_date|date_pl }}. <a href="{{ url_for(\'dph_dashboard\', year=invoice.supply_date[:4], month=invoice.supply_date[5:7]) }}">Otwórz raport</a>.</div>{% elif dph_info.warning %}<div class="callout warning"><strong>DPH do sprawdzenia:</strong> {{ dph_info.warning }}</div>{% endif %}\n{% if linked_payout %}<div class="callout info"><strong>Prop firma:</strong> faktura jest powiązana z payoutem {{ linked_payout.firm_name }} otrzymanym {{ linked_payout.received_date|date_pl }}. W kalkulatorze przychodu liczony jest payout {{ linked_payout.income_czk|money(\'CZK\') }}, a faktura nie jest liczona drugi raz. <a href="{{ url_for(\'prop_payout_edit\', payout_id=linked_payout.id) }}">Otwórz payout</a>.</div>{% endif %}<div class="detail-grid">\n<section class="panel"><div class="panel-header"><h2>Dane faktury</h2><span class="badge badge-{{ invoice.status }}">{{ \'Opłacona\' if invoice.status == \'paid\' else \'Nieopłacona\' }}</span></div><dl class="details">\n<div><dt>Kontrahent</dt><dd>{{ invoice.contractor_name }}</dd></div><div><dt>VAT ID</dt><dd>{{ invoice.contractor_vat_id or \'—\' }}</dd></div>\n<div><dt>Data wystawienia</dt><dd>{{ invoice.issue_date|date_pl }}</dd></div><div><dt>Data usługi</dt><dd>{{ invoice.supply_date|date_pl }}</dd></div>\n<div><dt>Termin płatności</dt><dd>{{ invoice.due_date|date_pl }}</dd></div><div><dt>Data zapłaty</dt><dd>{{ invoice.paid_date|date_pl if invoice.paid_date else \'—\' }}</dd></div>\n<div><dt>Tryb VAT</dt><dd>{{ TAX_MODES[invoice.tax_mode] }}</dd></div><div><dt>Kurs do CZK</dt><dd>{{ invoice.czk_rate or (\'1\' if invoice.currency == \'CZK\' else \'—\') }}</dd></div>\n<div><dt>DPH / VIES</dt><dd>{{ dph_info.label }}</dd></div></dl></section>\n<section class="panel total-card"><span class="muted">Do zapłaty</span><strong>{{ totals.total_gross|money(invoice.currency) }}</strong>{% if dph_info.value_czk is not none %}<small>Do ewidencji: {{ dph_info.value_czk|money(\'CZK\') }}</small>{% endif %}</section>\n</div>\n<section class="panel"><h2>Pozycje</h2><div class="table-wrap"><table><thead><tr><th>Opis</th><th>Ilość</th><th>Jedn.</th><th>Cena</th>{% if invoice.tax_mode == \'vat\' %}<th>VAT</th>{% endif %}<th>Wartość</th></tr></thead><tbody>{% for item in items %}<tr><td>{{ item.description }}</td><td>{{ item.quantity_decimal }}</td><td>{{ item.unit }}</td><td>{{ item.unit_price_decimal|money(invoice.currency) }}</td>{% if invoice.tax_mode == \'vat\' %}<td>{{ item.vat_rate_decimal }}%</td>{% endif %}<td>{{ item.gross|money(invoice.currency) }}</td></tr>{% endfor %}</tbody></table></div></section>\n{% if invoice.reverse_charge_note or invoice.notes %}<section class="panel">{% if invoice.reverse_charge_note %}<h2>Adnotacja</h2><p>{{ invoice.reverse_charge_note }}</p>{% endif %}{% if invoice.notes %}<h2>Uwagi</h2><p class="preline">{{ invoice.notes }}</p>{% endif %}</section>{% endif %}\n<section class="panel"><div class="panel-header"><h2>Kursy zapisane dla tej faktury</h2>\n<a class="btn btn-light" href="{{ url_for(\'invoice_payment\',invoice_id=invoice.id) }}">Data i kurs zapłaty</a></div>\n{% set dq = fx_quote(\'invoice\',invoice.id,\'document\') %}{% set pq = fx_quote(\'invoice\',invoice.id,\'payment\') %}\n<p><strong>Faktura / DPH:</strong> {{ invoice.czk_rate or \'brak\' }} CZK za 1 {{ invoice.currency }}.\n{% if dq %}Data kursu {{ dq.requested_date|date_pl }}, źródło {{ \'ČNB, tabela z \' ~ (dq.published_date|date_pl) if dq.source == \'cnb\' else \'kurs ręczny / CZK\' }}.{% else %}Starszy zapis bez metadanych; nie został automatycznie zmieniony.{% endif %}</p>\n{% if linked_payout %}<p><strong>PIT:</strong> przychód jest liczony z powiązanego payoutu — nie z tej faktury drugi raz.</p>\n{% elif pq %}<p><strong>Przychód według zapłaty:</strong> {{ pq.rate }} CZK za 1 {{ pq.currency }}, otrzymano {{ pq.requested_date|date_pl }}.\nŹródło: {{ \'ČNB, tabela z \' ~ (pq.published_date|date_pl) if pq.source == \'cnb\' else \'kurs ręczny / CZK\' }}.</p>\n{% elif invoice.status == \'paid\' and invoice.currency != \'CZK\' %}<p class="fx-error">Brak osobnego kursu zapłaty. Do czasu jego uzupełnienia kalkulator zachowuje starszy kurs faktury i pokazuje ostrzeżenie.</p>\n{% endif %}\n<p class="muted">Zmiana kursu otrzymanej zapłaty nie zmienia kursu dokumentu, DPH ani kwoty do zapłaty w walucie.</p></section>\n<div class="danger-zone paid-actions">\n    {% if invoice.status == \'paid\' %}\n    <form method="post" action="{{ url_for(\'invoice_toggle_paid\', invoice_id=invoice.id) }}"><button class="btn btn-light" type="submit">Oznacz jako nieopłaconą</button></form>\n    {% else %}\n    <form method="post" action="{{ url_for(\'invoice_toggle_paid\', invoice_id=invoice.id) }}" class="paid-date-form"><label class="field"><span>Data otrzymania zapłaty</span><input type="date" name="paid_date" value="{{ today }}" required></label><button class="btn btn-primary" type="submit">Oznacz jako opłaconą</button></form>\n    {% endif %}\n    <form method="post" action="{{ url_for(\'invoice_delete\', invoice_id=invoice.id) }}" onsubmit="return confirm(\'Usunąć fakturę {{ invoice.invoice_number }}?\')"><button class="btn btn-danger" type="submit">Usuń fakturę</button></form>\n</div>\n{% endblock %}\n'
+EMBEDDED_TEMPLATES['settings_tabs.html'] = '<nav class="settings-tabs" aria-label="Sekcje ustawień">\n <a class="{% if request.endpoint == \'settings_page\' and settings_tab|default(\'tax\') == \'tax\' %}active{% endif %}" href="{{ url_for(\'settings_page\', year=selected_year|default(snapshot.year if snapshot is defined else current_year), tab=\'tax\') }}">Podatki i składki</a>\n <a class="{% if settings_tab|default(\'\') == \'contractors\' or request.endpoint in [\'contractors_list\',\'contractor_new\',\'contractor_edit\'] %}active{% endif %}" href="{{ url_for(\'contractors_list\') }}">Kontrahenci</a>\n <a class="{% if settings_tab|default(\'\') == \'projects\' or request.endpoint in [\'projects_list\',\'project_new\',\'project_edit\'] %}active{% endif %}" href="{{ url_for(\'projects_list\') }}">Projekty</a>\n <a class="{% if settings_tab|default(\'\') == \'forecast\' %}active{% endif %}" href="{{ url_for(\'settings_page\', year=selected_year|default(snapshot.year if snapshot is defined else current_year), tab=\'forecast\') }}">Prognoza przyszłych składek</a>\n <a class="{% if settings_tab|default(\'\') == \'fx\' %}active{% endif %}" href="{{ url_for(\'fx_settings_page\') }}">Kursy walut</a>\n</nav>\n'
+EMBEDDED_JS += '\n// V8.3: debounced, race-safe requests. Server revalidates all automatic rates.\ndocument.addEventListener(\'DOMContentLoaded\', function(){\n  document.querySelectorAll(\'.fx-controls\').forEach(function(box){\n    const form=box.closest(\'form\'), currency=document.getElementById(box.dataset.fxCurrency),\n      rate=document.getElementById(box.dataset.fxRate), dateInput=box.querySelector(\'.fx-date\'),\n      business=form.querySelector(\'[name="\'+box.dataset.fxBusinessDate+\'"]\'),\n      mode=box.querySelector(\'.fx-mode\'), button=box.querySelector(\'.fx-fetch\'),\n      status=box.querySelector(\'.fx-message\');\n    if(!form||!currency||!rate||!mode||!dateInput) return;\n    const savedRate=rate.value, savedCurrency=currency.value.trim().toUpperCase(), savedDate=dateInput.value;\n    let serial=0, controller=null, timer=null, pending=false, failed=false;\n    function message(text,error=false){status.textContent=text;status.classList.toggle(\'fx-error\',error);}\n    async function refresh(){\n      clearTimeout(timer); const token=++serial;\n      if(controller) controller.abort(); controller=null; pending=false; failed=false;\n      rate.setCustomValidity(\'\'); rate.readOnly=mode.value!==\'manual\';\n      button.disabled=false; rate.required=mode.value!==\'keep\';\n      if(mode.value===\'keep\'){\n        rate.value=savedRate;\n        if(currency.value.trim().toUpperCase()!==savedCurrency || dateInput.value!==savedDate){\n          failed=true; message(\'Zmieniono walutę lub datę. Wybierz ponownie ČNB albo kurs ręczny.\',true);\n        } else message(\'Zachowano wcześniej zapisany kurs. Otwarcie dokumentu nie przelicza historii.\');\n        rate.dispatchEvent(new Event(\'input\',{bubbles:true})); return;\n      }\n      if(mode.value===\'manual\'){\n        message(\'Wpisz własny udokumentowany kurs. Nie zostanie nadpisany przez automat.\');\n        return;\n      }\n      rate.value=\'\'; rate.dispatchEvent(new Event(\'input\',{bubbles:true}));\n      const code=currency.value.trim().toUpperCase(), day=dateInput.value;\n      if(!code||!day){failed=true;message(\'Uzupełnij walutę i datę.\');return;}\n      pending=true; message(\'Pobieranie kursu ČNB…\'); button.disabled=true;\n      controller=new AbortController();\n      try{\n        const query=new URLSearchParams({currency:code,date:day});\n        const result=await fetch(box.dataset.fxEndpoint+\'?\'+query.toString(),{signal:controller.signal,headers:{\'Accept\':\'application/json\'},cache:\'no-store\'});\n        const data=await result.json();\n        if(token!==serial) return;\n        if(!result.ok||!data.ok) throw new Error(data.error||\'Nie udało się pobrać kursu ČNB.\');\n        rate.value=data.rate;\n        rate.dispatchEvent(new Event(\'input\',{bubbles:true}));\n        message(data.notice);\n      }catch(error){\n        if(token!==serial||error.name===\'AbortError\') return;\n        failed=true; rate.value=\'\'; rate.dispatchEvent(new Event(\'input\',{bubbles:true}));\n        message(error.message||\'Błąd połączenia. Spróbuj ponownie albo wybierz kurs ręczny.\',true);\n      }finally{if(token===serial){pending=false;button.disabled=false;}}\n    }\n    mode.addEventListener(\'change\',refresh);\n    dateInput.addEventListener(\'change\',refresh);\n    currency.addEventListener(\'input\',function(){\n      if(controller) controller.abort(); serial++; pending=true;\n      if(mode.value===\'cnb\') {rate.value=\'\';message(\'Oczekiwanie na kod waluty…\');}\n      clearTimeout(timer);timer=setTimeout(refresh,400);\n    });\n    if(business) business.addEventListener(\'change\',function(){dateInput.value=business.value;refresh();});\n    button.addEventListener(\'click\',function(){mode.value=\'cnb\';refresh();});\n    form.addEventListener(\'submit\',function(event){\n      if(pending || (failed&&mode.value!==\'manual\')){\n        event.preventDefault();message(pending?\'Poczekaj na pobranie kursu.\':\'Nie zapisano kursu. Pobierz ponownie albo wybierz kurs ręczny.\',true);\n      }\n    });\n    refresh();\n  });\n});\n'
+EMBEDDED_CSS += '\n.fx-controls{padding:16px;border:1px solid #cbd5e1;border-radius:12px;background:#f8fafc;margin:12px 0 18px}\n.fx-message{font-size:14px;line-height:1.5;margin:10px 0;color:#155e75;min-height:22px}\n.fx-error{color:#a32a18!important;font-weight:600}\n.fx-controls .form-grid{margin:0}.fx-controls .field{min-width:0}\ninput[readonly]{background:#f1f5f9}\n@media(max-width:900px){.fx-controls{padding:12px}.fx-fetch{width:100%}}\n'
+
 APP_DIR = Path(__file__).resolve().parent
 
 
@@ -1835,6 +1900,12 @@ def upload_file_to_supabase(local_path: Path, object_path: str) -> bool:
 
 
 def upload_remote_database() -> bool:
+    """Serializuj snapshot i upload w jednym procesie (jeden worker)."""
+    with _REMOTE_SYNC_LOCK:
+        return _upload_remote_database_locked()
+
+
+def _upload_remote_database_locked() -> bool:
     """Wysyła spójny snapshot bazy po każdej zmianie."""
     if not REMOTE_DB_ENABLED or not DB_PATH.exists():
         return False
@@ -1856,6 +1927,11 @@ def upload_remote_database() -> bool:
 # Na darmowym Renderze lokalny dysk znika po uśpieniu/restarcie.
 # Dlatego pobieramy bazę zanim uruchomimy migracje i init_db().
 REMOTE_DB_DOWNLOADED = download_remote_database()
+if CLOUD_MODE and REMOTE_DB_ENABLED and not REMOTE_DB_DOWNLOADED:
+    raise RuntimeError(
+        "Nie pobrano istniejącej bazy z Supabase. Wersja V8.2 nie utworzy ani nie nadpisze pustej bazy w chmurze. "
+        "Sprawdź połączenie, klucz i obiekt data/invoice_app.db; dla nowego wdrożenia wgraj prywatnie posiadaną bazę."
+    )
 
 def _migrate_legacy_database() -> str | None:
     """Kopiuje bazę ze starej wieloplikowej wersji przy pierwszym uruchomieniu."""
@@ -1882,7 +1958,7 @@ def _migrate_legacy_database() -> str | None:
     return None
 
 
-MIGRATED_FROM = _migrate_legacy_database()
+MIGRATED_FROM = None if '--self-test' in sys.argv else _migrate_legacy_database()
 
 app = Flask(__name__, static_folder=None)
 app.secret_key = SECRET_KEY
@@ -2563,12 +2639,7 @@ def init_prop_firms_module() -> None:
         )
     db.commit()
 
-with app.app_context():
-    init_db()
-    init_tax_module()
-    init_prop_firms_module()
-    if REMOTE_DB_ENABLED:
-        upload_remote_database()
+# V8.2: initialization is at the end of this file.
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -2994,7 +3065,8 @@ def validate_invoice(invoice: dict[str, Any], items: list[dict[str, Any]]) -> li
         invoice["czk_rate"] = "1"
     elif invoice.get("czk_rate"):
         try:
-            if parse_decimal(invoice["czk_rate"], "kurs") <= 0:
+            rate_value = parse_decimal(invoice["czk_rate"], "kurs")
+            if not rate_value.is_finite() or rate_value <= 0:
                 raise ValueError
         except ValueError:
             errors.append("Kurs do CZK musi być większy od zera.")
@@ -3037,7 +3109,7 @@ def inject_prop_globals() -> dict[str, Any]:
 
 @app.context_processor
 def inject_v7_globals() -> dict[str, Any]:
-    return {"auth_enabled": bool(APP_PASSWORD), "cloud_mode": CLOUD_MODE}
+    return {"auth_enabled": bool(APP_PASSWORD), "cloud_mode": CLOUD_MODE, "current_year": date.today().year}
 
 
 
@@ -3066,6 +3138,13 @@ def v72_sync_database_after_change(response):
             upload_remote_database()
     except Exception as exc:
         print(f"Supabase: błąd automatycznej synchronizacji: {exc}")
+    return response
+
+
+@app.after_request
+def v82_no_private_cache(response):
+    if request.endpoint not in {"static", "app_icon", "manifest", "service_worker"}:
+        response.headers["Cache-Control"] = "no-store, private"
     return response
 
 
@@ -3118,7 +3197,7 @@ def manifest():
 def service_worker():
     # Nie cache'ujemy danych finansowych offline. SW daje instalowalność PWA
     # i prosty fallback dla powłoki aplikacji.
-    script = """const CACHE='faktury-shell-v8';
+    script = """const CACHE='faktury-shell-v83';
 self.addEventListener('install',e=>{self.skipWaiting();});
 self.addEventListener('activate',e=>{e.waitUntil(self.clients.claim());});
 self.addEventListener('fetch',e=>{
@@ -3213,6 +3292,7 @@ def company_edit() -> str:
 
 
 @app.route("/projects")
+@app.route("/settings/projects")
 def projects_list() -> str:
     rows = get_db().execute(
         """SELECT p.*, c.name AS contractor_name
@@ -3236,6 +3316,7 @@ def _project_payload(existing_id: int | None = None) -> dict[str, Any]:
 
 
 @app.route("/projects/new", methods=["GET", "POST"])
+@app.route("/settings/projects/new", methods=["GET", "POST"])
 def project_new() -> str:
     db = get_db()
     contractors = [dict(r) for r in db.execute("SELECT * FROM contractors ORDER BY name COLLATE NOCASE").fetchall()]
@@ -3261,6 +3342,7 @@ def project_new() -> str:
 
 
 @app.route("/projects/<int:project_id>/edit", methods=["GET", "POST"])
+@app.route("/settings/projects/<int:project_id>/edit", methods=["GET", "POST"])
 def project_edit(project_id: int) -> str:
     db = get_db()
     row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
@@ -3286,6 +3368,7 @@ def project_edit(project_id: int) -> str:
 
 
 @app.post("/projects/<int:project_id>/delete")
+@app.post("/settings/projects/<int:project_id>/delete")
 def project_delete(project_id: int):
     db = get_db()
     db.execute("DELETE FROM projects WHERE id=?", (project_id,))
@@ -3296,6 +3379,7 @@ def project_delete(project_id: int):
 
 
 @app.route("/contractors")
+@app.route("/settings/contractors")
 def contractors_list() -> str:
     q = request.args.get("q", "").strip()
     db = get_db()
@@ -3331,6 +3415,7 @@ def contractor_from_request(existing_id: int | None = None) -> dict[str, Any]:
 
 
 @app.route("/contractors/new", methods=["GET", "POST"])
+@app.route("/settings/contractors/new", methods=["GET", "POST"])
 def contractor_new() -> str:
     contractor: dict[str, Any] = {
         "name": "", "address": "", "postal_code": "", "city": "", "country": "Österreich",
@@ -3356,6 +3441,7 @@ def contractor_new() -> str:
 
 
 @app.route("/contractors/<int:contractor_id>/edit", methods=["GET", "POST"])
+@app.route("/settings/contractors/<int:contractor_id>/edit", methods=["GET", "POST"])
 def contractor_edit(contractor_id: int) -> str:
     db = get_db()
     row = db.execute("SELECT * FROM contractors WHERE id = ?", (contractor_id,)).fetchone()
@@ -3382,6 +3468,7 @@ def contractor_edit(contractor_id: int) -> str:
 
 
 @app.post("/contractors/<int:contractor_id>/delete")
+@app.post("/settings/contractors/<int:contractor_id>/delete")
 def contractor_delete(contractor_id: int):
     db = get_db()
     try:
@@ -3495,10 +3582,17 @@ def prop_payout_payload(existing_id: int | None = None) -> dict[str, Any]:
     net_raw = request.form.get("net_amount", "").strip()
     net = parse_decimal(net_raw, "kwota netto") if net_raw else gross - fee
     currency = request.form.get("currency", "USD").strip().upper()
-    rate = Decimal("1") if currency == "CZK" else parse_decimal(request.form.get("czk_rate", ""), "kurs do CZK")
+    existing_row = get_db().execute("SELECT * FROM prop_payouts WHERE id=?", (existing_id,)).fetchone() if existing_id else None
+    existing = dict(existing_row) if existing_row else None
+    previous = fx_quote('payout', existing_id, 'income') if existing else None
+    rate_text, fx = resolve_form_fx(currency, request.form.get('received_date','').strip(),
+                                   request.form.get('czk_rate',''), existing, previous,
+                                   existing['received_date'] if existing else None)
+    rate = parse_decimal(rate_text, 'kurs payoutu')
     amounts = payout_amount_breakdown(gross, fee, net, rate)
     return {
         "id": existing_id,
+        "_fx_quote": fx,
         "prop_firm_id": int(firm_raw) if firm_raw.isdigit() else None,
         "payout_identifier": request.form.get("payout_identifier", "").strip(),
         "received_date": request.form.get("received_date", "").strip(),
@@ -3665,7 +3759,9 @@ def prop_payout_new() -> str:
         if errors:
             for error in errors: flash(error, "error")
             return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=False)
-        db.execute("""INSERT INTO prop_payouts (prop_firm_id,payout_identifier,received_date,currency,gross_amount,operator_fee,net_amount,czk_rate,income_czk,linked_invoice_id,tax_classification,qualification_status,dph_treatment,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", tuple(payout[key] for key in ("prop_firm_id","payout_identifier","received_date","currency","gross_amount","operator_fee","net_amount","czk_rate","income_czk","linked_invoice_id","tax_classification","qualification_status","dph_treatment","notes"))); db.commit()
+        cursor = db.execute("""INSERT INTO prop_payouts (prop_firm_id,payout_identifier,received_date,currency,gross_amount,operator_fee,net_amount,czk_rate,income_czk,linked_invoice_id,tax_classification,qualification_status,dph_treatment,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", tuple(payout[key] for key in ("prop_firm_id","payout_identifier","received_date","currency","gross_amount","operator_fee","net_amount","czk_rate","income_czk","linked_invoice_id","tax_classification","qualification_status","dph_treatment","notes")))
+        save_fx_quote("payout", int(cursor.lastrowid), "income", payout.get("_fx_quote"))
+        db.commit()
         flash("Payout został zapisany.", "success"); return redirect(url_for("prop_firms_dashboard", year=payout["received_date"][:4]))
     return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=False)
 
@@ -3684,7 +3780,9 @@ def prop_payout_edit(payout_id: int) -> str:
         if errors:
             for error in errors: flash(error, "error")
             return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=True)
-        db.execute("""UPDATE prop_payouts SET prop_firm_id=?,payout_identifier=?,received_date=?,currency=?,gross_amount=?,operator_fee=?,net_amount=?,czk_rate=?,income_czk=?,linked_invoice_id=?,tax_classification=?,qualification_status=?,dph_treatment=?,notes=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""", tuple(payout[key] for key in ("prop_firm_id","payout_identifier","received_date","currency","gross_amount","operator_fee","net_amount","czk_rate","income_czk","linked_invoice_id","tax_classification","qualification_status","dph_treatment","notes")) + (payout_id,)); db.commit()
+        db.execute("""UPDATE prop_payouts SET prop_firm_id=?,payout_identifier=?,received_date=?,currency=?,gross_amount=?,operator_fee=?,net_amount=?,czk_rate=?,income_czk=?,linked_invoice_id=?,tax_classification=?,qualification_status=?,dph_treatment=?,notes=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""", tuple(payout[key] for key in ("prop_firm_id","payout_identifier","received_date","currency","gross_amount","operator_fee","net_amount","czk_rate","income_czk","linked_invoice_id","tax_classification","qualification_status","dph_treatment","notes")) + (payout_id,))
+        save_fx_quote("payout", payout_id, "income", payout.get("_fx_quote"))
+        db.commit()
         flash("Payout został zaktualizowany.", "success"); return redirect(url_for("prop_firms_dashboard", year=payout["received_date"][:4]))
     return render_template("prop_payout_form.html", payout=payout, firms=firms, invoices=invoices, is_edit=True)
 
@@ -3693,6 +3791,7 @@ def prop_payout_edit(payout_id: int) -> str:
 def prop_payout_delete(payout_id: int):
     db = get_db(); row = db.execute("SELECT received_date FROM prop_payouts WHERE id=?", (payout_id,)).fetchone()
     if row is None: abort(404)
+    db.execute("DELETE FROM fx_quotes WHERE entity_type='payout' AND entity_id=?", (payout_id,))
     db.execute("DELETE FROM prop_payouts WHERE id=?", (payout_id,)); db.commit(); flash("Payout został usunięty.", "success")
     return redirect(url_for("prop_firms_dashboard", year=str(row["received_date"])[:4]))
 
@@ -3857,6 +3956,296 @@ def prop_payout_rows(year: int) -> tuple[list[dict[str, Any]], list[str]]:
         result.append(item)
     return result, warnings
 
+# ---------------------------------------------------------------------------
+# V8.2: read-only contribution forecast. Scenarios never create tax receipts.
+# Parameters are stored by target year, independently of historical settings.
+# ---------------------------------------------------------------------------
+V82_MIGRATION_KEY = 'v8_2_settings_and_contribution_forecast'
+CONTRIBUTION_PARAMETER_DEFAULTS = {
+    2027: {
+        'cssz_min_base': '18083', 'cssz_max_base': '206652',
+        'vzp_min_base': '25831.50', 'cssz_assessment_percent': '55',
+        'cssz_rate_percent': '29.2', 'vzp_assessment_percent': '50',
+        'vzp_rate_percent': '13.5', 'status': 'law_derived',
+        'source_note': 'Wyliczenie z NV 177/2026 Sb.: 48 900 × 1,0565 = 51 662,85 → 51 663 Kč. '
+                       'Min. ČSSZ: ceil(35% × 51 663) = 18 083 Kč; VZP: 50% × 51 663 = 25 831,50 Kč. '
+                       'Nie jest to indywidualny předpis zaliczek. Stan na 07.10.2026.',
+    },
+}
+
+
+def v82_backup_before_migration() -> Path | None:
+    """Back up a current database before any V8.2 schema change. Fail closed."""
+    if not DB_PATH.exists() or not DB_PATH.stat().st_size:
+        return None
+    with sqlite3.connect(DB_PATH) as source:
+        exists = source.execute("SELECT 1 FROM sqlite_master WHERE name='app_migrations'").fetchone()
+        if exists and source.execute('SELECT 1 FROM app_migrations WHERE migration_key=?',
+                                     (V82_MIGRATION_KEY,)).fetchone():
+            return None
+        name = 'przed_aktualizacja_V8_2_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.sqlite3'
+        target = BACKUP_DIR / name
+        with sqlite3.connect(target) as dest:
+            source.backup(dest)
+            if dest.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise RuntimeError('V8.2: kopia bazy nie przeszła kontroli. Migracja zatrzymana.')
+    if REMOTE_DB_ENABLED and not upload_file_to_supabase(target, 'backups/' + name):
+        raise RuntimeError('V8.2: nie zapisano kopii przed migracją w Supabase. Migracja zatrzymana.')
+    return target
+
+
+def init_v82_module() -> None:
+    db = get_db()
+    db.executescript('''
+        CREATE TABLE IF NOT EXISTS contribution_year_parameters (
+            year INTEGER PRIMARY KEY,
+            cssz_min_base TEXT NOT NULL,
+            cssz_max_base TEXT NOT NULL,
+            vzp_min_base TEXT NOT NULL,
+            cssz_assessment_percent TEXT NOT NULL DEFAULT '55',
+            cssz_rate_percent TEXT NOT NULL DEFAULT '29.2',
+            vzp_assessment_percent TEXT NOT NULL DEFAULT '50',
+            vzp_rate_percent TEXT NOT NULL DEFAULT '13.5',
+            status TEXT NOT NULL DEFAULT 'unverified',
+            source_note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS contribution_forecast_settings (
+            source_year INTEGER PRIMARY KEY,
+            as_of_date TEXT NOT NULL DEFAULT '',
+            additional_revenue_60 TEXT NOT NULL DEFAULT '0',
+            additional_revenue_40 TEXT NOT NULL DEFAULT '0',
+            cssz_months_override INTEGER NOT NULL DEFAULT 0,
+            vzp_months_override INTEGER NOT NULL DEFAULT 0,
+            cssz_advance_exempt INTEGER NOT NULL DEFAULT 0,
+            vzp_advance_exempt INTEGER NOT NULL DEFAULT 0,
+            vzp_minimum_applies INTEGER NOT NULL DEFAULT 1,
+            cssz_report_month INTEGER NOT NULL DEFAULT 0,
+            vzp_report_month INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
+    for year, values in CONTRIBUTION_PARAMETER_DEFAULTS.items():
+        keys = list(values)
+        db.execute('INSERT OR IGNORE INTO contribution_year_parameters (year,' + ','.join(keys) + ') '
+                   'VALUES (' + ','.join('?' for _ in range(len(keys) + 1)) + ')',
+                   (year,) + tuple(values[k] for k in keys))
+    db.execute('INSERT OR IGNORE INTO app_migrations (migration_key) VALUES (?)', (V82_MIGRATION_KEY,))
+    db.commit()
+
+
+def contribution_forecast_settings(source_year: int) -> dict[str, Any]:
+    """GET does not create settings or overwrite tax records."""
+    row = get_db().execute('SELECT * FROM contribution_forecast_settings WHERE source_year=?',
+                           (source_year,)).fetchone()
+    if row:
+        return dict(row)
+    return dict(source_year=source_year, as_of_date='', additional_revenue_60='0',
+                additional_revenue_40='0', cssz_months_override=0, vzp_months_override=0,
+                cssz_advance_exempt=0, vzp_advance_exempt=0, vzp_minimum_applies=1,
+                cssz_report_month=0, vzp_report_month=0, note='')
+
+
+def contribution_year_parameters(year: int) -> dict[str, Any] | None:
+    row = get_db().execute('SELECT * FROM contribution_year_parameters WHERE year=?', (year,)).fetchone()
+    return dict(row) if row else None
+
+
+def estimate_next_advances(profit: Decimal, cssz_months: int, vzp_months: int,
+                           parameters: dict[str, Any], options: dict[str, Any]) -> dict[str, Decimal]:
+    """Monthly advances after the overview, for continuing hlavní SVČ.
+
+    ČSSZ rounds the monthly assessment up first and the premium up again.
+    Both months of hlavní and vedlejší belong in the source-year denominator.
+    VZP has no upper assessment limit. Paid advances never reduce next year's rate.
+    """
+    if not 1 <= cssz_months <= 12 or not 1 <= vzp_months <= 12:
+        raise ValueError('Prognoza wymaga od 1 do 12 miesięcy działalności.')
+    d = lambda k: parse_decimal(parameters[k], k)
+    profit = max(Decimal('0'), profit)
+    cssz_rate = d('cssz_rate_percent') / Decimal('100')
+    vzp_rate = d('vzp_rate_percent') / Decimal('100')
+    cssz_raw = ceil_whole(profit * d('cssz_assessment_percent') / Decimal('100') / Decimal(cssz_months))
+    cssz_base = min(max(cssz_raw, d('cssz_min_base')), d('cssz_max_base'))
+    vzp_raw = profit * d('vzp_assessment_percent') / Decimal('100') / Decimal(vzp_months)
+    vzp_min = d('vzp_min_base') if options.get('vzp_minimum_applies', 1) else Decimal('0')
+    vzp_base = max(vzp_raw, vzp_min)
+    cssz = ceil_whole(cssz_base * cssz_rate)
+    vzp = ceil_whole(vzp_base * vzp_rate)
+    if options.get('cssz_advance_exempt'):
+        cssz = Decimal('0')
+    if options.get('vzp_advance_exempt'):
+        vzp = Decimal('0')
+    return dict(cssz=cssz, vzp=vzp, total=cssz + vzp,
+                cssz_raw=cssz_raw, cssz_base=cssz_base, vzp_base=q2(vzp_base),
+                cssz_from_income=ceil_whole(min(cssz_raw, d('cssz_max_base')) * cssz_rate),
+                vzp_from_income=ceil_whole(vzp_raw * vzp_rate))
+
+
+def compute_contribution_forecast(source_year: int, as_of: date | None = None) -> dict[str, Any]:
+    settings = ensure_tax_settings(source_year)
+    options = contribution_forecast_settings(source_year)
+    parameters = contribution_year_parameters(source_year + 1)
+    raw_cutoff = options.get('as_of_date', '')
+    cutoff = as_of or (date.fromisoformat(raw_cutoff) if raw_cutoff else date.today())
+    cutoff = min(max(cutoff, date(source_year, 1, 1)), date(source_year, 12, 31))
+    invoices, warnings = tax_invoice_rows(source_year, 'paid')
+    invoices = [r for r in invoices if date.fromisoformat(r['recognized_date']) <= cutoff]
+    payouts, payout_warnings = prop_payout_rows(source_year)
+    warnings.extend(payout_warnings)
+    payouts = [r for r in payouts if date.fromisoformat(r['received_date']) <= cutoff]
+    included = [r for r in payouts if r['tax_classification'] in {'s7_60', 's7_40'}]
+    excluded = [r for r in payouts if r['tax_classification'] == 'exclude']
+    welding = q2(sum((r['value_czk'] for r in invoices), Decimal('0')))
+    prop60 = q2(sum((r['income_czk'] for r in included if r['tax_classification'] == 's7_60'), Decimal('0')))
+    prop40 = q2(sum((r['income_czk'] for r in included if r['tax_classification'] == 's7_40'), Decimal('0')))
+    for r in included:
+        if r.get('qualification_status') != 'confirmed':
+            warnings.append(f"{r['firm_name']}: kwalifikacja kosztów jest oceną dokumentów, a nie decyzją urzędu.")
+    if excluded:
+        warnings.append(f'Wyłączono {len(excluded)} payout(y) według ich ręcznej kwalifikacji podatkowej.')
+    if settings.get('revenue_basis') != 'paid':
+        warnings.append('Zachowano ustawienie „według wystawienia” w głównym kalkulatorze. '
+                        'Ta prognoza zawsze korzysta z zapłaconych faktur i otrzymanych payoutów.')
+    months_auto = active_months_for_year(settings, source_year)
+    cssz_months = options['cssz_months_override'] or months_auto
+    vzp_months = options['vzp_months_override'] or months_auto
+    cssz_main, cssz_secondary = status_month_counts(settings, source_year, 'cssz_mode', 'cssz_main_from_date')
+    warnings.append('Zakłada się kontynuację głównej OSVČ w następnym roku i podleganie czeskim ubezpieczeniom. '
+                    'Nie jest to wyliczenie dla przejścia na vedlejší ani paušální daň.')
+    if source_year >= date.today().year and not settings.get('activity_end_date'):
+        warnings.append('Brak daty zakończenia: liczba miesięcy zakłada działalność do 31 grudnia, '
+                        'nawet w scenariuszu bez kolejnych przychodów.')
+    pending = []
+    linked_ids = {r[0] for r in get_db().execute('SELECT linked_invoice_id FROM prop_payouts WHERE linked_invoice_id IS NOT NULL')}
+    for raw in get_db().execute("SELECT * FROM invoices WHERE status <> 'paid' ORDER BY issue_date, id"):
+        inv = dict(raw)
+        if inv['id'] in linked_ids or inv['issue_date'] > cutoff.isoformat():
+            continue
+        if not inv['supply_date'].startswith(str(source_year)):
+            continue
+        items = [dict(x) for x in get_db().execute('SELECT * FROM invoice_items WHERE invoice_id=?', (inv['id'],))]
+        totals = calculate_items(items, inv['tax_mode'])
+        amount = totals['total_net'] if inv['tax_mode'] == 'vat' else totals['total_gross']
+        rate = decimal_rate(inv['currency'], inv.get('czk_rate'))
+        pending.append(dict(id=inv['id'], number=inv['invoice_number'], amount=amount,
+                            currency=inv['currency'], value_czk=q2(amount * rate) if rate is not None else None))
+    unknown = [r['number'] for r in pending if r['value_czk'] is None]
+    if unknown:
+        warnings.append('Nieopłacone faktury bez kursu CZK: ' + ', '.join(unknown) + '. Nie są doliczane ani wyceniane zgadywanym kursem.')
+    if not parameters:
+        warnings.append(f'Nie ma zweryfikowanych parametrów składek dla {source_year+1}. Uzupełnij je w Ustawieniach; nie kopiujemy minimów poprzedniego roku.')
+    def scenario(extra60: Decimal, extra40: Decimal) -> dict[str, Any]:
+        g60, g40 = q2(welding + prop60 + extra60), q2(prop40 + extra40)
+        grouped = calculate_grouped_percentage_costs(
+            g60, g40, parse_decimal(settings['expense_percent']), parse_decimal(settings['expense_limit']),
+            parse_decimal(settings.get('expense_40_percent', '40')), parse_decimal(settings.get('expense_40_limit', '800000')))
+        result = dict(revenue=g60 + g40, group60=g60, group40=g40,
+                      costs=grouped['flat_expenses'], profit=grouped['profit'],
+                      additional=extra60 + extra40, advances=None)
+        if parameters and cssz_months and vzp_months:
+            result['advances'] = estimate_next_advances(grouped['profit'], cssz_months, vzp_months, parameters, options)
+        return result
+    actual = scenario(Decimal('0'), Decimal('0'))
+    simulated = scenario(parse_decimal(options['additional_revenue_60']), parse_decimal(options['additional_revenue_40']))
+    current_cssz = parse_decimal(settings['cssz_monthly_advance'])
+    current_vzp = parse_decimal(settings['vzp_monthly_advance'])
+    current_total = current_cssz + current_vzp
+    january = None
+    if parameters:
+        minimum = estimate_next_advances(Decimal('0'), 1, 1, parameters, options)
+        january_cssz = Decimal('0') if options['cssz_advance_exempt'] else max(current_cssz, minimum['cssz'])
+        january_vzp = Decimal('0') if options['vzp_advance_exempt'] else max(current_vzp, minimum['vzp'])
+        january = dict(cssz=january_cssz, vzp=january_vzp, total=january_cssz + january_vzp)
+        for row in (actual, simulated):
+            if row['advances']:
+                row['advances']['difference'] = row['advances']['total'] - current_total
+                row['advances']['difference_cssz'] = row['advances']['cssz'] - current_cssz
+                row['advances']['difference_vzp'] = row['advances']['vzp'] - current_vzp
+        january['difference'] = january['total'] - current_total
+    else:
+        minimum = None
+    for flag in ('cssz_advance_exempt', 'vzp_advance_exempt'):
+        if options[flag]:
+            warnings.append('Zastosowano ręcznie zadeklarowane zwolnienie z zaliczek. Nie oznacza ono zwolnienia z rocznej składki.')
+    return dict(source_year=source_year, target_year=source_year+1, as_of=cutoff.isoformat(),
+                options=options, parameters=parameters, actual=actual, simulated=simulated,
+                has_scenario=simulated['additional'] > 0, welding_revenue=welding,
+                prop_revenue=prop60+prop40, cash_revenue=welding+prop60+prop40,
+                cssz_months=cssz_months, vzp_months=vzp_months,
+                cssz_main_months=cssz_main, cssz_secondary_months=cssz_secondary,
+                current_cssz=current_cssz, current_vzp=current_vzp, current_total=current_total,
+                january=january, minimum=minimum, pending=pending,
+                warnings=list(dict.fromkeys(warnings)), invoices=invoices, payouts=included)
+
+
+@app.post('/settings/contributions/forecast')
+def contribution_forecast_save():
+    try:
+        year = int(request.form.get('source_year', date.today().year))
+        if not 2020 <= year <= 2099:
+            raise ValueError('Nieprawidłowy rok.')
+        ensure_tax_settings(year)
+        values = {'as_of_date': _valid_date_or_blank(request.form.get('as_of_date', ''), 'data prognozy')}
+        if values['as_of_date'] and date.fromisoformat(values['as_of_date']).year != year:
+            raise ValueError('Data prognozy musi należeć do wybranego roku.')
+        for key in ('additional_revenue_60', 'additional_revenue_40'):
+            n = parse_decimal(request.form.get(key, '0'), key)
+            if not n.is_finite() or n < 0:
+                raise ValueError('Przychód prognozowany nie może być ujemny ani nieskończony.')
+            values[key] = str(q2(n))
+        for key in ('cssz_months_override', 'vzp_months_override', 'cssz_report_month', 'vzp_report_month'):
+            n = int(request.form.get(key, '0') or 0)
+            if not 0 <= n <= 12:
+                raise ValueError('Liczba miesięcy musi mieścić się w przedziale 0–12.')
+            values[key] = n
+        for key in ('cssz_advance_exempt', 'vzp_advance_exempt', 'vzp_minimum_applies'):
+            values[key] = 1 if request.form.get(key) == '1' else 0
+        values['note'] = request.form.get('note', '').strip()[:2000]
+    except (ValueError, TypeError, InvalidOperation) as exc:
+        flash(str(exc), 'error')
+        return redirect(url_for('settings_page', tab='forecast'))
+    db = get_db(); keys = list(values)
+    db.execute('INSERT OR IGNORE INTO contribution_forecast_settings (source_year) VALUES (?)', (year,))
+    db.execute('UPDATE contribution_forecast_settings SET ' + ','.join(k+'=?' for k in keys) +
+               ',updated_at=CURRENT_TIMESTAMP WHERE source_year=?', tuple(values[k] for k in keys)+(year,))
+    db.commit()
+    flash('Założenia prognozy zapisane. Nie utworzono żadnych transakcji ani wpłat.', 'success')
+    return redirect(url_for('settings_page', year=year, tab='forecast'))
+
+
+@app.post('/settings/contributions/parameters')
+def contribution_parameters_save():
+    try:
+        year = int(request.form.get('target_year', '0'))
+        if not 2021 <= year <= 2100:
+            raise ValueError('Nieprawidłowy rok parametrów.')
+        keys = ('cssz_min_base', 'cssz_max_base', 'vzp_min_base', 'cssz_assessment_percent',
+                'cssz_rate_percent', 'vzp_assessment_percent', 'vzp_rate_percent')
+        values = {}
+        for key in keys:
+            value = parse_decimal(request.form.get(key, ''), key)
+            if not value.is_finite() or value < 0 or (key.endswith('percent') and value > 100):
+                raise ValueError('Nieprawidłowa wartość: '+key)
+            values[key] = str(value)
+        if parse_decimal(values['cssz_max_base']) < parse_decimal(values['cssz_min_base']):
+            raise ValueError('Maksymalna podstawa ČSSZ nie może być niższa od minimalnej.')
+        values['status'] = 'manual'
+        values['source_note'] = request.form.get('source_note', '').strip()[:2000]
+    except (ValueError, TypeError, InvalidOperation) as exc:
+        flash(str(exc), 'error')
+        return redirect(url_for('settings_page', tab='forecast'))
+    keys = list(values); db = get_db()
+    db.execute('INSERT INTO contribution_year_parameters (year,'+','.join(keys)+') VALUES ('+
+               ','.join('?' for _ in range(len(keys)+1))+') ON CONFLICT(year) DO UPDATE SET '+
+               ','.join(k+'=excluded.'+k for k in keys)+',updated_at=CURRENT_TIMESTAMP',
+               (year,)+tuple(values[k] for k in keys))
+    db.commit()
+    flash('Parametry prognozy zapisane dla '+str(year)+'. Historyczne ustawienia rozliczenia bez zmian.', 'success')
+    return redirect(url_for('settings_page', year=year-1, tab='forecast'))
+
+
 def ensure_tax_settings(year: int) -> dict[str, Any]:
     db = get_db()
     row = db.execute("SELECT * FROM tax_settings WHERE year=?", (year,)).fetchone()
@@ -3874,6 +4263,17 @@ def ensure_tax_settings(year: int) -> dict[str, Any]:
                 2026, "2026-07-08", "paid", "60", "1200000", "30840", "0", "0", "1762812",
                 "mixed", "2026-08-01", "117521", "9794", "55", "29.2", "17139", "5387", "5005",
                 "mixed", "2026-08-01", "50", "13.5", "24483.50", "3306"
+            ))
+        elif year == 2027:
+            db.execute("""INSERT INTO tax_settings (
+                year,activity_start_date,revenue_basis,income_tax_credit,employment_tax_base,
+                employment_tax_withheld,tax_threshold,cssz_mode,cssz_main_from_date,
+                cssz_threshold_annual,cssz_threshold_reduction_month,cssz_min_monthly_base,
+                cssz_secondary_min_monthly_base,cssz_monthly_advance,vzp_mode,vzp_main_from_date,
+                vzp_min_monthly_base,vzp_monthly_advance
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                year, "2027-01-01", "paid", "30840", "0", "0", "1859868", "main", "2027-01-01",
+                "123992", "10333", "18083", "5683", "5281", "main", "2027-01-01", "25831.50", "3488"
             ))
         else:
             start = f"{year}-01-01"
@@ -3984,7 +4384,8 @@ def tax_invoice_rows(year: int, basis: str) -> tuple[list[dict[str, Any]], list[
             continue
         items = db.execute("SELECT * FROM invoice_items WHERE invoice_id=?", (invoice["id"],)).fetchall()
         totals = calculate_items([dict(item) for item in items], invoice["tax_mode"])
-        rate = decimal_rate(invoice.get("currency"), invoice.get("czk_rate"))
+        rate = (income_rate_for_invoice(invoice, warnings) if basis == "paid"
+                else decimal_rate(invoice.get("currency"), invoice.get("czk_rate")))
         if rate is None:
             warnings.append(f"{invoice['invoice_number']}: brak kursu {invoice.get('currency','')} do CZK; faktura nie została doliczona.")
             continue
@@ -4183,7 +4584,11 @@ def settings_page() -> str:
     except ValueError:
         year = date.today().year
     snapshot = compute_tax_snapshot(year)
-    return render_template("settings.html", snapshot=snapshot)
+    tab = request.args.get("tab", "tax")
+    if tab not in {"tax", "forecast"}:
+        tab = "tax"
+    return render_template("settings.html", snapshot=snapshot, selected_year=year,
+                           settings_tab=tab, forecast=compute_contribution_forecast(year))
 
 
 @app.route("/taxes")
@@ -4195,7 +4600,8 @@ def taxes_dashboard() -> str:
     except ValueError:
         year = date.today().year
     snapshot = compute_tax_snapshot(year)
-    return render_template("taxes_dashboard.html", snapshot=snapshot, payments=snapshot["payments"], today=date.today().isoformat())
+    return render_template("taxes_dashboard.html", snapshot=snapshot, payments=snapshot["payments"],
+                           today=date.today().isoformat(), forecast=compute_contribution_forecast(year))
 
 
 @app.post("/taxes/settings")
@@ -4373,6 +4779,7 @@ def invoice_new() -> str:
         invoice, items = default_new_invoice(company, request.args.get("contractor_id", ""))
         return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors, projects=projects, company=company, is_edit=False)
     invoice, items = invoice_form_from_request(); errors = validate_invoice(invoice, items)
+    if not errors: errors.extend(prepare_invoice_fx(invoice))
     if errors:
         for error in errors: flash(error, "error")
         return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors, projects=projects, company=company, is_edit=False)
@@ -4392,6 +4799,7 @@ def invoice_new() -> str:
             vat = "0" if invoice["tax_mode"] != "vat" else str(parse_decimal(item["vat_rate"]))
             db.execute("INSERT INTO invoice_items (invoice_id, position, description, quantity, unit, unit_price, vat_rate) VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (invoice_id, pos, item["description"].strip(), str(parse_decimal(item["quantity"])), item["unit"].strip(), str(parse_decimal(item["unit_price"])), vat))
+        save_fx_quote("invoice", invoice_id, "document", invoice.get("_fx_quote"))
         db.commit()
     except Exception:
         db.rollback(); raise
@@ -4429,6 +4837,7 @@ def invoice_edit(invoice_id: int) -> str:
         items = [dict(r) for r in db.execute("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY position,id", (invoice_id,)).fetchall()]
         return render_template("invoice_form.html", invoice=existing, items=items, contractors=contractors, projects=projects, company=company, is_edit=True)
     invoice, items = invoice_form_from_request(existing); errors = validate_invoice(invoice, items)
+    if not errors: errors.extend(prepare_invoice_fx(invoice, existing))
     if errors:
         for error in errors: flash(error, "error")
         return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors, projects=projects, company=company, is_edit=True)
@@ -4443,6 +4852,7 @@ def invoice_edit(invoice_id: int) -> str:
         vat = "0" if invoice["tax_mode"] != "vat" else str(parse_decimal(item["vat_rate"]))
         db.execute("INSERT INTO invoice_items (invoice_id, position, description, quantity, unit, unit_price, vat_rate) VALUES (?, ?, ?, ?, ?, ?, ?)",
                    (invoice_id, pos, item["description"].strip(), str(parse_decimal(item["quantity"])), item["unit"].strip(), str(parse_decimal(item["unit_price"])), vat))
+    save_fx_quote("invoice", invoice_id, "document", invoice.get("_fx_quote"))
     db.commit()
     try:
         path = save_invoice_pdf_to_disk(invoice_id); flash(f"Faktura {existing['invoice_number']} została zaktualizowana. PDF: {path.parent}", "success")
@@ -4454,23 +4864,17 @@ def invoice_edit(invoice_id: int) -> str:
 @app.post("/invoices/<int:invoice_id>/toggle-paid")
 def invoice_toggle_paid(invoice_id: int):
     db = get_db()
-    row = db.execute("SELECT status,paid_date FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    row = db.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
     if row is None:
         abort(404)
-    if row["status"] == "paid":
-        db.execute("UPDATE invoices SET status='unpaid',paid_date='',updated_at=CURRENT_TIMESTAMP WHERE id=?", (invoice_id,))
-        message = "Faktura została oznaczona jako nieopłacona."
-    else:
-        paid_date = request.form.get("paid_date", date.today().isoformat()).strip()
-        try:
-            date.fromisoformat(paid_date)
-        except ValueError:
-            flash("Podaj prawidłową datę zapłaty.", "error")
-            return redirect(request.referrer or url_for("invoice_view", invoice_id=invoice_id))
-        db.execute("UPDATE invoices SET status='paid',paid_date=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (paid_date, invoice_id))
-        message = "Faktura została oznaczona jako opłacona."
-    db.commit(); flash(message, "success")
-    return redirect(request.referrer or url_for("invoice_view", invoice_id=invoice_id))
+    if row["status"] != "paid":
+        return redirect(url_for('invoice_payment', invoice_id=invoice_id,
+                                date=request.form.get('paid_date','')))
+    db.execute("UPDATE invoices SET status='unpaid',paid_date='',updated_at=CURRENT_TIMESTAMP WHERE id=?", (invoice_id,))
+    db.execute("DELETE FROM fx_quotes WHERE entity_type='invoice' AND entity_id=? AND purpose='payment'", (invoice_id,))
+    db.commit()
+    flash("Faktura została oznaczona jako nieopłacona. Kurs dokumentu pozostał bez zmian.", "success")
+    return redirect(url_for('invoice_view', invoice_id=invoice_id))
 
 
 @app.post("/invoices/<int:invoice_id>/delete")
@@ -4479,6 +4883,7 @@ def invoice_delete(invoice_id: int):
     row = db.execute("SELECT invoice_number FROM invoices WHERE id = ?", (invoice_id,)).fetchone()
     if row is None:
         abort(404)
+    db.execute("DELETE FROM fx_quotes WHERE entity_type='invoice' AND entity_id=?", (invoice_id,))
     db.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
     db.commit()
     flash(f"Faktura {row['invoice_number']} została usunięta. Numer nie zostanie użyty ponownie.", "success")
@@ -5093,6 +5498,7 @@ def reset_invoices():
         pdf_archive = BACKUP_DIR / f"PDF_przed_resetem_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         shutil.move(str(INVOICE_PDF_DIR), str(pdf_archive)); INVOICE_PDF_DIR.mkdir(parents=True, exist_ok=True)
     try:
+        db.execute("DELETE FROM fx_quotes WHERE entity_type='invoice'")
         db.execute("DELETE FROM invoice_items"); db.execute("DELETE FROM invoices"); db.execute("DELETE FROM invoice_sequences")
         db.execute("DELETE FROM dph_filings"); db.execute("DELETE FROM sqlite_sequence WHERE name IN ('invoices','invoice_items')"); db.commit()
     except Exception:
@@ -5128,9 +5534,15 @@ def import_database():
         if current is not None:
             current.close()
         os.replace(temp_path, DB_PATH)
+        ts_backup_before_migration()
+        v83_backup_before_migration()
+        v82_backup_before_migration()
         init_db()
         init_tax_module()
         init_prop_firms_module()
+        init_v82_module()
+        init_v83_module()
+        init_timesheets_module()
         contractor_count = get_db().execute("SELECT COUNT(*) AS c FROM contractors").fetchone()["c"]
         backup_note = f" Poprzednia baza: {backup_path.name}." if backup_path else ""
         flash(f"Baza została zaimportowana. Wczytano {contractor_count} kontrahentów.{backup_note}", "success")
@@ -5164,9 +5576,1136 @@ def open_browser() -> None:
     webbrowser.open_new("http://127.0.0.1:5000")
 
 
+# ---------------- V8.3: official CNB daily rates, immutable snapshots ----------------
+V83_MIGRATION_KEY = 'v8_3_cnb_exchange_rates'
+CNB_DAILY_URL = ('https://www.cnb.cz/cs/financni-trhy/devizovy-trh/'
+                 'kurzy-devizoveho-trhu/kurzy-devizoveho-trhu/denni_kurz.txt')
+_FX_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_FX_CACHE_LOCK = threading.RLock()
+
+
+class FxError(ValueError):
+    def __init__(self, message: str, status: int = 422):
+        super().__init__(message)
+        self.status = status
+
+
+def fx_today() -> date:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo('Europe/Prague')).date()
+
+
+def fx_easter(year: int) -> date:
+    # Gregorian computus, used only to identify Czech bank holidays.
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    gg = (b - f + 1) // 3
+    h = (19*a + b - d - gg + 15) % 30
+    i, k = c // 4, c % 4
+    ll = (32 + 2*e + 2*i - h - k) % 7
+    m = (a + 11*h + 22*ll) // 451
+    n = h + ll - 7*m + 114
+    return date(year, n // 31, n % 31 + 1)
+
+
+def fx_is_business_day(day: date) -> bool:
+    fixed = {(1,1), (5,1), (5,8), (7,5), (7,6), (9,28), (10,28), (11,17), (12,24), (12,25), (12,26)}
+    easter = fx_easter(day.year)
+    holidays = {easter + timedelta(days=1)}
+    if day.year >= 2016:
+        holidays.add(easter - timedelta(days=2))
+    return day.weekday() < 5 and (day.month, day.day) not in fixed and day not in holidays
+
+
+def fx_publication_date(day: date) -> date:
+    while not fx_is_business_day(day):
+        day -= timedelta(days=1)
+    return day
+
+
+def parse_cnb_daily_text(text: str) -> dict[str, Any]:
+    """Parse documented Czech TXT format. Rates are CZK per ONE currency unit."""
+    lines = [line.strip() for line in text.lstrip('\ufeff').splitlines() if line.strip()]
+    match = re.fullmatch(r'(\d{2})\.(\d{2})\.(\d{4})\s+#(\d+)', lines[0] if lines else '')
+    if not match or len(lines) < 3 or '|' not in lines[1]:
+        raise FxError('ČNB zwrócił nieprawidłowy format danych. Żaden kurs nie został zapisany.', 502)
+    try:
+        published = date(int(match[3]), int(match[2]), int(match[1]))
+    except ValueError as exc:
+        raise FxError('Nieprawidłowa data tabeli ČNB.', 502) from exc
+    rates = {}
+    for line in lines[2:]:
+        columns = line.split('|')
+        if len(columns) != 5:
+            raise FxError('Nieprawidłowa pozycja w tabeli ČNB.', 502)
+        country, name, quantity, code, price = columns
+        if not re.fullmatch(r'[A-Z]{3}', code):
+            raise FxError('Nieprawidłowy kod waluty w danych ČNB.', 502)
+        try:
+            amount = Decimal(quantity)
+            rate = Decimal(price.replace(',', '.'))
+            if not amount.is_finite() or amount <= 0 or amount != amount.to_integral_value():
+                raise ValueError
+            if not rate.is_finite() or rate <= 0:
+                raise ValueError
+        except (InvalidOperation, ValueError) as exc:
+            raise FxError('Nieprawidłowa wartość kursu ČNB.', 502) from exc
+        if code in rates:
+            raise FxError('Powtórzona waluta w danych ČNB.', 502)
+        rates[code] = {'rate': format(rate / amount, 'f'), 'amount': int(amount),
+                       'table_rate': format(rate, 'f')}
+    if 'EUR' not in rates or 'USD' not in rates:
+        raise FxError('Niekompletna tabela ČNB.', 502)
+    return {'published_date': published.isoformat(), 'rates': rates}
+
+
+def fetch_cnb_rate(currency: str, requested_date: str) -> dict[str, Any]:
+    """No guessed/stale rates, no USD alias for USDT, no future dates."""
+    import time
+    currency = str(currency).strip().upper()
+    try:
+        day = date.fromisoformat(requested_date)
+    except (ValueError, TypeError) as exc:
+        raise FxError('Wybierz poprawną datę kursu.') from exc
+    today = fx_today()
+    if day > today:
+        raise FxError('Kursu z przyszłości jeszcze nie ma. Wybierz rzeczywistą datę albo wpisz kurs ręcznie.')
+    if day.year < 2002:
+        raise FxError('Automatyczne kursy w tej wersji obsługują daty od 2002 roku.')
+    if currency == 'CZK':
+        return {'currency': 'CZK', 'rate': '1', 'requested_date': day.isoformat(),
+                'published_date': day.isoformat(), 'source': 'identity', 'source_url': '',
+                'fetched_at': datetime.now().isoformat(timespec='seconds'), 'notice': '1 CZK = 1 CZK'}
+    if currency in {'USDT','USDC','BTC','ETH','DAI','WETH','MUSD'}:
+        raise FxError('ČNB nie publikuje kursu tego tokena. Wpisz udokumentowaną wartość 1 tokena w CZK ręcznie. Nie przyjmujemy automatycznie USDT = USD.')
+    if not re.fullmatch(r'[A-Z]{3}', currency):
+        raise FxError('Podaj trzyznakowy kod waluty, np. EUR, USD lub PLN.')
+    expected = fx_publication_date(day)
+    key = expected.isoformat()
+    url = CNB_DAILY_URL + '?' + urllib.parse.urlencode({'date': expected.strftime('%d.%m.%Y')})
+    with _FX_CACHE_LOCK:
+        cached = _FX_CACHE.get(key)
+        ttl = 300 if expected == today else 86400
+        table = cached[1] if cached and time.monotonic() - cached[0] < ttl else None
+        if table is None:
+            req = urllib.request.Request(url, headers={'Accept':'text/plain', 'User-Agent':'FakturyOSVC/8.3'})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    host = urllib.parse.urlparse(response.geturl()).hostname
+                    if host not in {'www.cnb.cz','cnb.cz'}:
+                        raise FxError('Nieoczekiwane przekierowanie serwera ČNB.', 502)
+                    raw = response.read(100001)
+                    if len(raw) > 100000:
+                        raise FxError('Odpowiedź ČNB jest zbyt duża.', 502)
+                table = parse_cnb_daily_text(raw.decode('utf-8-sig'))
+            except FxError:
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError, UnicodeError) as exc:
+                raise FxError('Nie udało się połączyć z ČNB. Spróbuj ponownie później albo wybierz kurs ręczny; nie użyto przypadkowego kursu.', 503) from exc
+            if table['published_date'] != key:
+                if expected == today:
+                    raise FxError('Kurs ČNB na ten dzień nie jest jeszcze opublikowany (zwykle około 14:30 czasu czeskiego). Nie podstawiamy kursu z wczoraj.', 409)
+                raise FxError('Data tabeli ČNB nie odpowiada wybranemu dniowi. Sprawdź datę lub wpisz kurs ręcznie.', 502)
+            if len(_FX_CACHE) >= 512:
+                _FX_CACHE.pop(next(iter(_FX_CACHE)))
+            _FX_CACHE[key] = (time.monotonic(), table)
+    if currency not in table['rates']:
+        raise FxError(f'Brak waluty {currency} w dziennej tabeli ČNB. Wybierz udokumentowany kurs ręcznie.')
+    data = table['rates'][currency]
+    notice = (f'Kurs ČNB z {expected.strftime("%d.%m.%Y")}, ważny na {day.strftime("%d.%m.%Y")}. '
+              f'1 {currency} = {data["rate"]} CZK.')
+    if day != expected:
+        notice += ' Uwzględniono weekend / czeskie święto.'
+    return {'currency':currency, **data, 'requested_date':day.isoformat(),
+            'published_date':key, 'source':'cnb', 'source_url':url,
+            'fetched_at':datetime.now().isoformat(timespec='seconds'), 'notice':notice}
+
+
+def v83_backup_before_migration() -> Path | None:
+    if not DB_PATH.exists() or not DB_PATH.stat().st_size:
+        return None
+    with sqlite3.connect(DB_PATH) as source:
+        table = source.execute("SELECT 1 FROM sqlite_master WHERE name='app_migrations'").fetchone()
+        if table and source.execute('SELECT 1 FROM app_migrations WHERE migration_key=?', (V83_MIGRATION_KEY,)).fetchone():
+            return None
+        target = BACKUP_DIR / ('przed_aktualizacja_V8_3_kursy_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.sqlite3')
+        with sqlite3.connect(target) as dest:
+            source.backup(dest)
+            if dest.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise RuntimeError('Niepoprawna kopia bezpieczeństwa. Migracja V8.3 zatrzymana.')
+    if REMOTE_DB_ENABLED and not upload_file_to_supabase(target, 'backups/' + target.name):
+        raise RuntimeError('Nie zapisano kopii V8.3 w Supabase. Migracja zatrzymana.')
+    return target
+
+
+def init_v83_module() -> None:
+    db = get_db()
+    db.executescript('''
+        CREATE TABLE IF NOT EXISTS fx_preferences (
+            id INTEGER PRIMARY KEY CHECK(id=1), default_auto INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS fx_quotes (
+            entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL, purpose TEXT NOT NULL,
+            currency TEXT NOT NULL, rate TEXT NOT NULL, requested_date TEXT NOT NULL,
+            published_date TEXT NOT NULL DEFAULT '', source TEXT NOT NULL,
+            source_url TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(entity_type,entity_id,purpose)
+        );
+        CREATE TABLE IF NOT EXISTS fx_quote_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL,
+            purpose TEXT NOT NULL, currency TEXT NOT NULL, rate TEXT NOT NULL, requested_date TEXT NOT NULL,
+            published_date TEXT NOT NULL DEFAULT '', source TEXT NOT NULL,
+            source_url TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL DEFAULT '',
+            saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT OR IGNORE INTO fx_preferences(id,default_auto) VALUES (1,1);
+    ''')
+    db.execute('INSERT OR IGNORE INTO app_migrations(migration_key) VALUES (?)', (V83_MIGRATION_KEY,))
+    db.commit()
+
+
+def fx_quote(entity_type: str, entity_id: int | None, purpose: str = 'document') -> dict[str, Any] | None:
+    if not entity_id:
+        return None
+    row = get_db().execute('SELECT * FROM fx_quotes WHERE entity_type=? AND entity_id=? AND purpose=?',
+                           (entity_type,entity_id,purpose)).fetchone()
+    return dict(row) if row else None
+
+
+def fx_default_auto() -> bool:
+    row = get_db().execute('SELECT default_auto FROM fx_preferences WHERE id=1').fetchone()
+    return bool(row and row['default_auto'])
+
+
+def fx_form_mode(is_edit: bool) -> str:
+    if request.method == 'POST' and request.form.get('fx_mode') in {'cnb','manual','keep'}:
+        return request.form['fx_mode']
+    return 'keep' if is_edit else ('cnb' if fx_default_auto() else 'manual')
+
+
+def resolve_form_fx(currency: str, requested_date: str, raw_rate: str,
+                    existing: dict[str, Any] | None = None,
+                    previous_quote: dict[str, Any] | None = None,
+                    old_date: str | None = None) -> tuple[str, dict[str, Any] | None]:
+    """Server-authoritative lookup; request cannot label a made-up value as CNB."""
+    mode = request.form.get('fx_mode', ('keep' if existing else ('manual' if raw_rate else 'cnb')))
+    if mode not in {'cnb','manual','keep'}:
+        raise FxError('Wybierz sposób ustalenia kursu.')
+    if mode == 'keep':
+        if not existing:
+            raise FxError('Nie ma wcześniejszego kursu do zachowania.')
+        if currency != existing['currency'] or (old_date is not None and requested_date != old_date):
+            raise FxError('Zmieniono walutę lub datę kursu. Wybierz pobranie ČNB albo wpisz kurs ręcznie.')
+        return str(existing.get('czk_rate') or ''), previous_quote
+    try:
+        date.fromisoformat(requested_date)
+    except (ValueError, TypeError) as exc:
+        raise FxError('Wybierz datę kursu.') from exc
+    if mode == 'cnb':
+        quote = fetch_cnb_rate(currency, requested_date)
+        return quote['rate'], quote
+    if currency == 'CZK':
+        rate = Decimal('1')
+    else:
+        try:
+            rate = Decimal(str(raw_rate).strip().replace(' ', '').replace(',', '.'))
+            if not rate.is_finite() or rate <= 0:
+                raise ValueError
+        except (InvalidOperation,ValueError) as exc:
+            raise FxError('Podaj dodatni, skończony kurs 1 jednostki waluty do CZK.') from exc
+    return format(rate,'f'), {'currency':currency,'rate':format(rate,'f'),
+        'requested_date':requested_date,'published_date':'','source':'manual',
+        'source_url':'','fetched_at':datetime.now().isoformat(timespec='seconds')}
+
+
+def save_fx_quote(entity_type: str, entity_id: int, purpose: str, quote: dict[str, Any] | None) -> None:
+    if quote is None:
+        return
+    keys = ('currency','rate','requested_date','published_date','source','source_url','fetched_at')
+    vals = (entity_type,entity_id,purpose) + tuple(str(quote.get(key) or '') for key in keys)
+    db = get_db()
+    old = fx_quote(entity_type,entity_id,purpose)
+    if old and all(str(old.get(k) or '') == str(quote.get(k) or '') for k in keys):
+        return
+    db.execute('''INSERT INTO fx_quotes(entity_type,entity_id,purpose,currency,rate,requested_date,published_date,source,source_url,fetched_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,purpose) DO UPDATE SET
+      currency=excluded.currency,rate=excluded.rate,requested_date=excluded.requested_date,
+      published_date=excluded.published_date,source=excluded.source,source_url=excluded.source_url,fetched_at=excluded.fetched_at''', vals)
+    db.execute('''INSERT INTO fx_quote_history(entity_type,entity_id,purpose,currency,rate,requested_date,published_date,source,source_url,fetched_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)''', vals)
+
+
+def prepare_invoice_fx(invoice: dict[str, Any], existing: dict[str, Any] | None = None) -> list[str]:
+    old = fx_quote('invoice',existing['id'],'document') if existing else None
+    target = request.form.get('fx_date','').strip() or invoice.get('supply_date','')
+    invoice['fx_requested_date'] = target
+    try:
+        previous_date = (old['requested_date'] if old else existing['supply_date']) if existing else None
+        if existing and invoice['supply_date'] != existing['supply_date'] and request.form.get('fx_mode','keep') == 'keep':
+            raise FxError('Po zmianie daty usługi wybierz ponownie kurs ČNB lub zatwierdź kurs ręczny.')
+        rate, quote = resolve_form_fx(invoice['currency'],target,invoice.get('czk_rate',''),existing,old,previous_date)
+        invoice['czk_rate'], invoice['_fx_quote'] = rate, quote
+        return []
+    except FxError as exc:
+        return [str(exc)]
+
+
+def income_rate_for_invoice(invoice: dict[str, Any], warnings: list[str]) -> Decimal | None:
+    if invoice.get('currency') == 'CZK':
+        return Decimal('1')
+    quote = fx_quote('invoice',invoice['id'],'payment')
+    if quote:
+        if quote['currency'] == invoice['currency'] and quote['requested_date'] == invoice.get('paid_date'):
+            return decimal_rate(invoice['currency'],quote['rate'])
+        warnings.append(f"{invoice['invoice_number']}: kurs otrzymanej zapłaty nie pasuje do waluty/daty. Popraw zapłatę; przychód pominięty.")
+        return None
+    # Keep historical calculations stable, but do not present the old rate as verified.
+    warnings.append(f"{invoice['invoice_number']}: brak osobnego kursu zapłaty; zachowano starszy kurs faktury. Zweryfikuj go w 'Data i kurs zapłaty'.")
+    return decimal_rate(invoice.get('currency'), invoice.get('czk_rate'))
+
+
+@app.context_processor
+def inject_fx_globals():
+    return {'fx_quote':fx_quote,'fx_form_mode':fx_form_mode}
+
+
+@app.get('/api/fx/cnb')
+def cnb_rate_api():
+    try:
+        result = fetch_cnb_rate(request.args.get('currency',''), request.args.get('date',''))
+        response = app.json.response({'ok':True, **result})
+    except FxError as exc:
+        response = app.json.response({'ok':False,'error':str(exc)})
+        response.status_code = exc.status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/settings/exchange-rates',methods=['GET','POST'])
+def fx_settings_page():
+    if request.method == 'POST':
+        get_db().execute('UPDATE fx_preferences SET default_auto=? WHERE id=1',
+                         (1 if request.form.get('default_auto') == '1' else 0,))
+        get_db().commit()
+        flash('Zapisano ustawienie automatycznych kursów. Starsze dokumenty pozostają bez zmian.','success')
+        return redirect(url_for('fx_settings_page'))
+    return render_template('fx_settings.html',default_auto=fx_default_auto(),settings_tab='fx')
+
+
+@app.route('/invoices/<int:invoice_id>/payment',methods=['GET','POST'])
+def invoice_payment(invoice_id: int):
+    invoice, items, totals = get_invoice_bundle(invoice_id)
+    linked = get_db().execute('SELECT id FROM prop_payouts WHERE linked_invoice_id=?',(invoice_id,)).fetchone()
+    if linked:
+        flash('Ta faktura jest powiązana z payoutem. Datę i kurs przychodu zapisuj w payoucie; nie dodajemy drugiej płatności.','success')
+        return redirect(url_for('prop_payout_edit',payout_id=linked['id']))
+    old = fx_quote('invoice',invoice_id,'payment')
+    paid_date = invoice.get('paid_date') or request.args.get('date') or fx_today().isoformat()
+    rate = old['rate'] if old else ''
+    is_edit = bool(old)
+    if request.method == 'POST':
+        paid_date = request.form.get('paid_date','').strip()
+        rate = request.form.get('czk_rate','').strip()
+        try:
+            day = date.fromisoformat(paid_date)
+            if day > fx_today():
+                raise FxError('Zapłata nie może mieć daty z przyszłości.')
+            existing = {'currency':old['currency'],'czk_rate':old['rate']} if old else None
+            rate, quote = resolve_form_fx(invoice['currency'],paid_date,rate,existing,old,old['requested_date'] if old else None)
+        except (ValueError,TypeError) as exc:
+            flash(str(exc) or 'Nieprawidłowa data zapłaty.','error')
+        else:
+            db = get_db()
+            db.execute("UPDATE invoices SET status='paid',paid_date=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(paid_date,invoice_id))
+            save_fx_quote('invoice',invoice_id,'payment',quote)
+            db.commit()
+            flash('Zapisano datę i kurs otrzymanej zapłaty. Kurs faktury / DPH pozostał bez zmian.','success')
+            return redirect(url_for('invoice_view',invoice_id=invoice_id))
+    return render_template('invoice_payment.html',invoice=invoice,totals=totals,paid_date=paid_date,rate=rate,is_edit=is_edit)
+
+
+
+# V8.4: listy godzin; izolowany moduł, bez zmian w obliczeniach podatku.
+import base64 as _ts_b64
+import hashlib as _ts_hash
+import json as _ts_json
+import math as _ts_math
+import random as _ts_random
+import zipfile as _ts_zip
+from reportlab.pdfgen import canvas as _ts_canvas
+from reportlab.lib.utils import ImageReader as _ts_ImageReader
+from PIL import Image as _ts_Image
+
+TS_STYLE = 'loose5-v1'
+TS_MONTHS_DE = ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember']
+TS_MAX_ROWS = 31
+TS_MAX_IMAGE = 2 * 1024 * 1024
+
+
+def ts_backup_before_migration() -> None:
+    if not DB_PATH.exists() or not DB_PATH.stat().st_size:
+        return
+    db = sqlite3.connect(DB_PATH)
+    try:
+        done = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='timesheet_settings'").fetchone()
+    finally:
+        db.close()
+    if not done:
+        backup = create_database_backup('przed_aktualizacja_V8_4_listy_godzin')
+        if REMOTE_DB_ENABLED and not upload_file_to_supabase(backup, 'backups/' + backup.name):
+            raise RuntimeError('Brak zdalnej kopii przed migracją list godzin. Baza nie została zmieniona.')
+
+
+def init_timesheets_module() -> None:
+    db = get_db()
+    db.executescript('''
+    CREATE TABLE IF NOT EXISTS timesheet_settings (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        options_json TEXT NOT NULL,
+        signature_png BLOB,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS timesheets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER UNIQUE REFERENCES invoices(id) ON DELETE SET NULL,
+        current_revision INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS timesheet_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sheet_id INTEGER NOT NULL REFERENCES timesheets(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        pdf_blob BLOB NOT NULL,
+        pdf_sha256 TEXT NOT NULL,
+        total_minutes INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(sheet_id, revision)
+    );
+    ''')
+    defaults = {
+        'company_label': 'EQUANS', 'worker_name': get_company().get('name',''),
+        'default_start': '06:30', 'default_end': '17:00', 'default_break': 30,
+        'thursday_end': '13:00', 'thursday_break': 30, 'style': TS_STYLE,
+        'show_project': False,
+    }
+    db.execute('INSERT OR IGNORE INTO timesheet_settings(id,options_json) VALUES(1,?)',
+               (_ts_json.dumps(defaults,ensure_ascii=False),))
+    db.commit()
+
+
+def ts_settings() -> dict[str, Any]:
+    row = get_db().execute('SELECT * FROM timesheet_settings WHERE id=1').fetchone()
+    result = _ts_json.loads(row['options_json'])
+    result['has_signature'] = bool(row['signature_png'])
+    return result
+
+
+def ts_current(sheet: dict[str, Any] | sqlite3.Row | None) -> dict[str, Any] | None:
+    if not sheet or not sheet['current_revision']:
+        return None
+    row = get_db().execute('SELECT * FROM timesheet_versions WHERE sheet_id=? AND revision=?',
+                           (sheet['id'],sheet['current_revision'])).fetchone()
+    if row is None:
+        return None
+    d = dict(row); d['payload'] = _ts_json.loads(d['payload_json'])
+    return d
+
+
+def ts_text(value: Any, name: str, max_len: int = 80, required: bool = True) -> str:
+    value = str(value or '').strip()
+    if required and not value:
+        raise ValueError('Uzupełnij: ' + name + '.')
+    if len(value) > max_len or any(ord(ch)<32 for ch in value):
+        raise ValueError(f'{name}: za długi tekst lub niedozwolone znaki.')
+    return value
+
+
+def ts_minutes(value: Any) -> int:
+    if not re.fullmatch(r'\d{2}:\d{2}',str(value)):
+        raise ValueError('Godziny wpisuj jako GG:MM, np. 06:30.')
+    h,m = map(int,str(value).split(':'))
+    if h>23 or m>59:
+        raise ValueError('Nieprawidłowa godzina.')
+    return h*60+m
+
+
+def ts_integer(value: Any, label: str, low: int = 0, high: int = 1440) -> int:
+    if not re.fullmatch(r'\d{1,4}',str('' if value is None else value).strip()):
+        raise ValueError(label + ': wpisz całkowitą liczbę minut.')
+    n = int(value)
+    if not low <= n <= high:
+        raise ValueError(label + ': wartość spoza dozwolonego zakresu.')
+    return n
+
+
+def ts_validate_rows(rows: list[dict[str, Any]], start: str, end: str) -> tuple[list[dict[str, Any]], int]:
+    try:
+        lo,hi = date.fromisoformat(start),date.fromisoformat(end)
+    except (TypeError,ValueError):
+        raise ValueError('Uzupełnij poprawną datę początku i końca okresu.') from None
+    if hi < lo or (hi-lo).days > 30:
+        raise ValueError('Jedna lista może obejmować od 1 do 31 kolejnych dni.')
+    if not 1 <= len(rows) <= TS_MAX_ROWS:
+        raise ValueError('Wpisz od 1 do 31 dni pracy.')
+    seen = set(); result = []; total = 0
+    for index,row in enumerate(rows,1):
+        try:
+            d = date.fromisoformat(str(row.get('date','')))
+        except ValueError:
+            raise ValueError(f'Wiersz {index}: nieprawidłowa data.') from None
+        if d in seen:
+            raise ValueError('Powtórzona data: ' + d.strftime('%d.%m.%Y'))
+        if not lo<=d<=hi:
+            raise ValueError('Data poza wybranym okresem: ' + d.strftime('%d.%m.%Y'))
+        seen.add(d)
+        begin,endm = ts_minutes(row.get('start')), ts_minutes(row.get('end'))
+        next_day = row.get('next_day') in (True,1,'1','on')
+        duration = endm - begin + (1440 if next_day else 0)
+        if duration <= 0 or duration > 1440:
+            raise ValueError(f'Wiersz {index}: koniec musi być po początku; dla nocy zaznacz „następny dzień”.')
+        pause = ts_integer(row.get('break_minutes',0),f'Wiersz {index} – przerwa',0,1439)
+        if pause >= duration:
+            raise ValueError(f'Wiersz {index}: przerwa musi być krótsza od całej zmiany.')
+        minutes = duration-pause
+        total+=minutes
+        result.append({'date':d.isoformat(),'start':f'{begin//60:02d}:{begin%60:02d}',
+                       'end':f'{endm//60:02d}:{endm%60:02d}', 'break_minutes':pause,
+                       'next_day':next_day,'minutes':minutes})
+    result.sort(key=lambda r:r['date'])
+    return result,total
+
+
+def ts_hours(minutes: int) -> str:
+    # Rachunki w minutach, bez utraty dokładności. Przy innych minutach niż
+    # wielokrotność kwadransa drukuj h/min zamiast zaokrąglać rozliczany czas.
+    if minutes % 15 == 0:
+        d = Decimal(minutes)/60
+        return format(d,'f').rstrip('0').rstrip('.') + ' h' if '.' in format(d,'f') else str(d)+' h'
+    return f'{minutes//60} h {minutes%60:02d} min'
+
+
+def ts_invoice_fingerprint(invoice: dict[str,Any], items: list[dict[str,Any]]) -> str:
+    data = {'contractor_id':invoice.get('contractor_id'),'order_number':invoice.get('order_number'),
+            'invoice_number':invoice.get('invoice_number'), 'currency':invoice.get('currency'),
+            'items':[{k:str(r.get(k,'')) for k in ('description','quantity','unit','unit_price','vat_rate')} for r in items]}
+    return _ts_hash.sha256(_ts_json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+def ts_hours_warning(invoice: dict[str,Any], items: list[dict[str,Any]], minutes: int) -> str:
+    units = {'h','hr','hrs','hour','hours','hod','hod.','hodina','hodiny','godz','godz.','std','std.','stunde','stunden'}
+    hours = [parse_decimal(str(r['quantity'])) for r in items if str(r.get('unit','')).lower().strip() in units]
+    if not hours:
+        return 'Faktura nie ma pozycji w godzinach. Sprawdź ręcznie, czy lista dotyczy tego samego zakresu prac.'
+    expected = sum(hours,Decimal('0'))
+    actual = Decimal(minutes)/Decimal(60)
+    if abs(expected-actual) > Decimal('0.000001'):
+        return f'Różnica: faktura ma {format(expected,"f")} h, lista {ts_hours(minutes)}. Faktura nie zostanie zmieniona automatycznie.'
+    return ''
+
+
+def ts_signature_clean(data: bytes) -> bytes:
+    if not data or len(data)>TS_MAX_IMAGE:
+        raise ValueError('Podpis: prześlij PNG/JPG do 2 MB.')
+    try:
+        with _ts_Image.open(BytesIO(data)) as source:
+            if source.width*source.height > 4_000_000:
+                raise ValueError('Podpis: obraz może mieć najwyżej 4 mln pikseli.')
+            if source.format not in {'PNG','JPEG','WEBP'}:
+                raise ValueError('Podpis musi być plikiem PNG, JPG albo WEBP.')
+            image = source.convert('RGBA')
+            image.thumbnail((1000,360))
+            out = BytesIO(); image.save(out,format='PNG',optimize=True)
+            return out.getvalue()
+    except (OSError,_ts_Image.DecompressionBombError):
+        raise ValueError('Nie można odczytać obrazu podpisu.') from None
+
+
+# Autorskie monoliniowe znaki wektorowe; bez dołączania plików czcionek.
+# Punkty (x,y) względem linii bazowej, części krzywe wygładzane przez Catmull-Rom.
+TS_GLYPHS = {
+'0': (0.62, [[(.44,1),(.18,.95),(.06,.55),(.08,.12),(.30,0),(.50,.20),(.58,.72),(.44,1)]]),
+'1': (0.44, [[(.02,.73),(.29,.98),(.25,.48),(.18,.0)]]),
+'2': (0.62, [[(.05,.77),(.20,1),(.46,.95),(.52,.71),(.30,.38),(.04,.03),(.27,.05),(.55,.03)]]),
+'3': (0.59, [[(.06,.86),(.30,.98),(.52,.81),(.39,.59),(.22,.52),(.46,.41),(.49,.13),(.28,-.01),(.03,.15)]]),
+'4': (0.63, [[(.43,1),(.07,.38),(.57,.34)],[(.49,.90),(.41,.02)]]),
+'5': (0.63, [[(.58,.96),(.16,.97),(.10,.54),(.37,.58),(.55,.38),(.43,.08),(.16,.02),(.03,.19)]]),
+'6': (0.62, [[(.52,.96),(.27,.88),(.07,.51),(.09,.13),(.29,.02),(.49,.15),(.52,.40),(.30,.53),(.07,.35)]]),
+'7': (0.63, [[(.03,.93),(.55,.95),(.31,.54),(.16,.02)],[(.16,.48),(.50,.50)]]),
+'8': (0.60, [[(.34,.56),(.09,.80),(.26,.98),(.48,.84),(.31,.55),(.07,.27),(.18,.02),(.45,.07),(.49,.34),(.34,.56)]]),
+'9': (0.61, [[(.51,.63),(.33,.97),(.11,.85),(.08,.59),(.31,.50),(.52,.68),(.48,.33),(.31,-.04)]]),
+'.': (.20,[[(.09,.02),(.11,.03)]]), ',':(.21,[[(.14,.06),(.10,-.11)]]),
+':':(.23,[[(.10,.65),(.12,.66)],[(.07,.14),(.09,.15)]]),
+'/':(.46,[[(.02,-.02),(.48,1.02)]]), '-':(.42,[[(.05,.39),(.36,.42)]]),
+'(': (.30,[[(.27,1.05),(.10,.71),(.08,.25),(.20,-.10)]]),
+')': (.30,[[(.09,1.05),(.22,.72),(.18,.23),(.02,-.10)]]),
+'+':(.62,[[(.02,.42),(.54,.43)],[(.29,.72),(.26,.13)]]),
+'a':(.59,[[(.43,.61),(.19,.68),(.04,.42),(.05,.13),(.20,.03),(.41,.28),(.47,.63),(.43,.13),(.51,.03),(.59,.15)]]),
+'b':(.59,[[(.06,.02),(.16,.73),(.28,1.03),(.26,.77),(.09,.24),(.23,.54),(.44,.62),(.53,.43),(.44,.16),(.21,.02),(.06,.07)]]),
+'c':(.51,[[(.46,.57),(.27,.67),(.07,.42),(.04,.18),(.17,.03),(.46,.15)]]),
+'d':(.64,[[(.46,.59),(.23,.66),(.07,.45),(.06,.17),(.22,.04),(.40,.22),(.54,.86),(.59,1.04),(.47,.48),(.43,.13),(.54,.02),(.63,.14)]]),
+'e':(.54,[[(.06,.32),(.37,.41),(.44,.59),(.25,.66),(.06,.43),(.06,.17),(.25,.04),(.53,.18)]]),
+'f':(.45,[[(.38,.97),(.21,1.05),(.09,.68),(.05,.11),(.0,-.28)],[(.01,.57),(.45,.58)]]),
+'g':(.60,[[(.44,.56),(.24,.66),(.07,.43),(.07,.16),(.24,.06),(.43,.28),(.49,.60),(.44,.12),(.34,-.35),(.14,-.43),(.08,-.28),(.31,-.10),(.57,.03)]]),
+'h':(.64,[[(.04,.02),(.16,.70),(.29,1.05),(.29,.84),(.11,.26),(.31,.58),(.47,.61),(.50,.44),(.44,.11),(.53,.01),(.64,.12)]]),
+'i':(.31,[[(.14,.60),(.06,.12),(.15,.02),(.29,.14)],[(.17,.87),(.18,.89)]]),
+'j':(.33,[[(.22,.59),(.13,-.25),(.01,-.42),(-.13,-.30)],[(.26,.87),(.27,.89)]]),
+'k':(.59,[[(.05,.02),(.22,1.06)],[(.51,.65),(.12,.30),(.32,.39),(.39,.11),(.52,.02),(.60,.13)]]),
+'l':(.35,[[(.10,.19),(.29,.77),(.29,1.05),(.15,.84),(.06,.31),(.11,.05),(.22,.01),(.34,.14)]]),
+'m':(.86,[[(.06,.59),(.02,.06),(.21,.49),(.34,.59),(.37,.43),(.29,.04),(.48,.49),(.63,.59),(.68,.43),(.63,.12),(.71,.03),(.85,.13)]]),
+'n':(.62,[[(.10,.60),(.02,.05),(.21,.46),(.39,.61),(.48,.48),(.43,.11),(.50,.02),(.62,.13)]]),
+'o':(.57,[[(.36,.65),(.12,.58),(.03,.28),(.13,.04),(.33,.07),(.47,.31),(.45,.57),(.36,.65)]]),
+'p':(.61,[[(.13,.65),(.06,.04),(-.01,-.38)],[(.10,.26),(.29,.59),(.47,.56),(.51,.35),(.33,.06),(.12,.11)]]),
+'q':(.60,[[(.45,.61),(.21,.64),(.04,.35),(.13,.09),(.32,.10),(.46,.44),(.38,-.33),(.47,-.20),(.58,-.10)]]),
+'r':(.47,[[(.11,.60),(.03,.05),(.21,.47),(.32,.65),(.37,.51),(.48,.49)]]),
+'s':(.48,[[(.44,.57),(.23,.66),(.10,.48),(.25,.31),(.37,.13),(.20,.02),(.02,.15)]]),
+'t':(.41,[[(.23,.90),(.12,.35),(.10,.10),(.21,.02),(.40,.14)],[(.02,.56),(.44,.58)]]),
+'u':(.63,[[(.13,.62),(.05,.21),(.12,.05),(.31,.17),(.51,.59),(.44,.14),(.51,.03),(.63,.14)]]),
+'v':(.55,[[(.06,.62),(.17,.02),(.51,.61)]]),
+'w':(.80,[[(.06,.62),(.11,.07),(.26,.10),(.43,.55),(.42,.08),(.56,.09),(.78,.65)]]),
+'x':(.56,[[(.09,.64),(.44,.04)],[(.49,.61),(.04,.03)]]),
+'y':(.62,[[(.12,.60),(.06,.20),(.18,.04),(.37,.25),(.52,.61),(.44,.05),(.27,-.39),(.08,-.42),(.11,-.25),(.57,.07)]]),
+'z':(.56,[[(.08,.57),(.50,.61),(.04,.04),(.50,.07)]]),
+'A':(.73,[[(.02,.0),(.45,1.02),(.66,.02)],[(.18,.35),(.60,.38)]]),
+'B':(.69,[[(.03,.02),(.16,.99)],[(.16,.97),(.47,.98),(.59,.78),(.36,.55),(.12,.52),(.46,.49),(.58,.24),(.39,.03),(.03,.02)]]),
+'C':(.73,[[(.68,.84),(.45,1.02),(.15,.84),(.04,.43),(.17,.06),(.48,.02),(.66,.21)]]),
+'D':(.72,[[(.02,.01),(.17,.99)],[(.16,.99),(.47,.91),(.66,.65),(.57,.23),(.29,.02),(.02,.01)]]),
+'E':(.66,[[(.63,.97),(.16,.99),(.05,.04),(.59,.03)],[(.11,.53),(.50,.56)]]),
+'F':(.63,[[(.07,0),(.17,.99),(.62,.98)],[(.13,.55),(.49,.56)]]),
+'G':(.76,[[(.70,.86),(.45,1),(.14,.80),(.04,.43),(.15,.12),(.43,.02),(.66,.23),(.68,.52),(.39,.51)]]),
+'H':(.76,[[(.12,.99),(.03,.01)],[(.70,1),(.59,.02)],[(.08,.49),(.64,.54)]]),
+'I':(.39,[[(.23,.99),(.13,.02)],[(.06,.98),(.38,1)],[(0,.02),(.31,.02)]]),
+'J':(.63,[[(.58,.97),(.46,.21),(.27,.01),(.07,.06),(.02,.24)],[(.28,.96),(.70,.99)]]),
+'K':(.72,[[(.16,1),(.06,.01)],[(.69,.98),(.12,.41),(.33,.54),(.66,.02)]]),
+'L':(.60,[[(.16,1),(.05,.03),(.57,.02)]]),
+'M':(.93,[[(.02,.02),(.16,.97),(.39,.30),(.79,1.02),(.83,.03)]]),
+'N':(.76,[[(.04,.02),(.16,1),(.64,.02),(.73,1.02)]]),
+'O':(.77,[[(.51,1),(.21,.90),(.04,.49),(.12,.11),(.39,.02),(.63,.25),(.71,.69),(.51,1)]]),
+'P':(.68,[[(.04,.0),(.17,1)],[(.17,.99),(.47,.98),(.60,.74),(.42,.54),(.11,.52)]]),
+'Q':(.78,[[(.52,1),(.21,.90),(.04,.49),(.12,.11),(.39,.02),(.64,.25),(.71,.69),(.52,1)],[(.40,.22),(.70,-.13)]]),
+'R':(.71,[[(.04,.0),(.17,1)],[(.17,.99),(.47,.98),(.60,.74),(.42,.54),(.11,.52)],[(.35,.53),(.63,.02)]]),
+'S':(.70,[[(.64,.84),(.44,.99),(.16,.82),(.18,.61),(.50,.43),(.59,.21),(.36,.01),(.06,.15)]]),
+'T':(.72,[[(.05,.96),(.74,1)],[(.43,.99),(.30,.01)]]),
+'U':(.78,[[(.13,.99),(.06,.35),(.16,.06),(.39,.03),(.62,.30),(.74,1)]]),
+'V':(.72,[[(.07,1),(.28,.02),(.72,1.03)]]),
+'W':(1.02,[[(.04,1),(.16,.02),(.52,.87),(.63,.02),(1.,1.02)]]),
+'X':(.71,[[(.07,.99),(.61,.02)],[(.71,.98),(.02,.02)]]),
+'Y':(.73,[[(.07,1),(.33,.51),(.71,1)],[(.33,.51),(.25,.01)]]),
+'Z':(.68,[[(.07,.99),(.68,1),(.03,.02),(.63,.03)]]),
+'&':(.72,[[(.59,.78),(.43,1),(.19,.85),(.23,.60),(.63,.02)],[(.27,.54),(.08,.30),(.23,.03),(.47,.11),(.68,.50)]]),
+}
+
+
+def ts_glyph(ch: str) -> tuple[float,list]:
+    if ch==' ': return .37,[]
+    if ch in TS_GLYPHS: return TS_GLYPHS[ch]
+    if ch in 'łŁ':
+        width,strokes=TS_GLYPHS['l' if ch=='ł' else 'L']
+        return width,strokes+[[(.02,.45),(.33,.63)]]
+    parts=unicodedata.normalize('NFD',ch)
+    if parts and parts[0] in TS_GLYPHS:
+        width,strokes=TS_GLYPHS[parts[0]]; strokes=list(strokes)
+        top=1.13 if parts[0].isupper() else .84
+        for accent in parts[1:]:
+            if accent=='\u0301': strokes.append([(.20,top),(.37,top+.19)])
+            elif accent=='\u0308': strokes.extend([[ (.15,top),(.16,top+.02)],[(.37,top),(.38,top+.02)]])
+            elif accent=='\u030c': strokes.append([(.11,top+.13),(.25,top),(.43,top+.16)])
+            elif accent=='\u0307': strokes.append([(.25,top),(.27,top+.03)])
+            elif accent=='\u0328': strokes.append([(.38,.04),(.26,-.16),(.40,-.17)])
+            elif accent=='\u030a': strokes.append([(.23,top),(.16,top+.13),(.28,top+.20),(.38,top+.11),(.23,top)])
+        return width,strokes
+    if ch in '–—': return TS_GLYPHS['-']
+    return .58, [[(.1,0),(.1,.9),(.5,.9),(.5,0),(.1,0)]]
+
+
+def ts_handwrite(c, text: str, x: float, y: float, size: float, max_width: float,
+                 seed: str, align: str = 'left') -> None:
+    glyphs=[ts_glyph(ch) for ch in text]
+    rng=_ts_random.Random(_ts_hash.sha256(seed.encode()).digest())
+    widths=[(g[0]+.10)*rng.uniform(.94,1.07) for g in glyphs]
+    total=sum(widths)*size
+    if total>max_width:
+        size*=max_width/total; total=max_width
+    if align=='center': x-=total/2
+    c.saveState(); c.setStrokeColorRGB(.08,.20,.74); c.setLineCap(1); c.setLineJoin(1)
+    cursor=x
+    for (width,strokes),advance in zip(glyphs,widths):
+        scale=size*rng.uniform(.96,1.04); slant=rng.uniform(.06,.16)
+        yj=y+rng.uniform(-.32,.32); angle=rng.uniform(-1.4,1.4)
+        c.saveState(); c.translate(cursor,yj); c.rotate(angle)
+        c.setLineWidth(max(.40,scale*.038)*rng.uniform(.92,1.08))
+        for stroke in strokes:
+            # Small per-character transformation, not destructive per-point noise.
+            pts=[((px+slant*py)*scale,py*scale) for px,py in stroke]
+            if not pts: continue
+            p=c.beginPath(); p.moveTo(*pts[0])
+            if len(pts)<4:
+                for pt in pts[1:]: p.lineTo(*pt)
+            else:
+                for i in range(len(pts)-1):
+                    a=pts[max(i-1,0)]; b=pts[i]; d=pts[i+1]; e=pts[min(i+2,len(pts)-1)]
+                    p.curveTo(b[0]+(d[0]-a[0])/6,b[1]+(d[1]-a[1])/6,
+                              d[0]-(e[0]-b[0])/6,d[1]-(e[1]-b[1])/6,*d)
+            c.drawPath(p,stroke=1,fill=0)
+        c.restoreState(); cursor+=advance*size
+    c.restoreState()
+
+
+def ts_build_pdf(payload: dict[str,Any], signature: bytes | None = None) -> bytes:
+    rows,total=ts_validate_rows(payload['rows'],payload['period_start'],payload['period_end'])
+    buf=BytesIO(); c=_ts_canvas.Canvas(buf,pagesize=A4,pageCompression=1,invariant=1)
+    w,h=A4; k=w/1024; py=lambda v:h-v*k
+    c.setTitle('Stundenzettel – '+payload['invoice_number'])
+    c.setAuthor(payload['worker_name'])
+    c.setSubject('Elektroniczna lista godzin, stylizowane pismo loose5; daty i czas zatwierdzone przez użytkownika.')
+    c.setFont('Helvetica',10)
+    c.drawString(420*k,py(77),'Firma:'); c.line(471*k,py(81),602*k,py(81))
+    seed=payload.get('seed','sample')
+    def hw(text,x,y,sz,maxw,field,align='left'):
+        ts_handwrite(c,text,x*k,py(y),sz*k,maxw*k,seed+':'+field,align)
+    hw(payload['company_label'],475,76,19,123,'company')
+    c.setFont('Helvetica',20); c.drawString(298*k,py(180),'Name:')
+    c.line(395*k,py(186),725*k,py(186))
+    hw(payload['worker_name'],400,179,23,319,'worker')
+    c.setLineWidth(.65); c.rect(49*k,py(220),925*k,25*k)
+    c.line(511*k,py(195),511*k,py(220))
+    c.setFont('Helvetica',9)
+    c.drawRightString(351*k,py(212),'Stundenzettel Monat:')
+    lo,hi=date.fromisoformat(payload['period_start']),date.fromisoformat(payload['period_end'])
+    months=[]; cursor=date(lo.year,lo.month,1)
+    while cursor<=hi:
+        months.append(TS_MONTHS_DE[cursor.month-1])
+        cursor=date(cursor.year+(cursor.month==12),1 if cursor.month==12 else cursor.month+1,1)
+    hw(' / '.join(months),366,213,20,138,'month')
+    c.drawString(612*k,py(212),'von:'); c.drawString(744*k,py(212),'bis:')
+    hw(lo.strftime('%d.%m.%Y'),652,212,16,90,'startdate')
+    hw(hi.strftime('%d.%m.%Y'),806,212,16,148,'enddate')
+    if payload.get('show_project') and payload.get('project_number'):
+        c.setFont('Helvetica',8);c.drawString(49*k,py(238),'Projekt:')
+        hw(payload['project_number'],102,238,14,395,'project')
+    xs=[49,229,409,589,769,974]; top=244; rh=(1272-top)/32
+    # 1 header + 31 data rows; original blank layout preserved.
+    for x in xs: c.line(x*k,py(top),x*k,py(1272))
+    for i in range(33):
+        y=top+i*rh; c.line(49*k,py(y),974*k,py(y))
+    labels=['Datum','Beginn','Ende','Pause','Arbeitszeit (abzgl. Pause)']
+    c.setFont('Helvetica',8.8)
+    for i,label in enumerate(labels): c.drawCentredString((xs[i]+xs[i+1])/2*k,py(265),label)
+    for i,row in enumerate(rows):
+        y=top+rh*(i+1)+rh*.68
+        vals=[date.fromisoformat(row['date']).strftime('%d.%m.'),str(int(row['start'][:2]))+row['start'][2:],
+              str(int(row['end'][:2]))+row['end'][2:]+(' (+1)' if row['next_day'] else ''),
+              ts_hours(row['break_minutes']),ts_hours(row['minutes'])]
+        for j,v in enumerate(vals):
+            hw(v,(xs[j]+xs[j+1])/2,y,19 if j!=2 or not row['next_day'] else 16,xs[j+1]-xs[j]-22,f'{row["date"]}:{j}','center')
+    c.setFont('Helvetica',8.5)
+    c.drawString(54*k,py(1294),'Vorlage von Arbeitszeiterfassung.com')
+    c.drawString(650*k,py(1294),'Summe:')
+    c.rect(769*k,py(1305),205*k,33*k)
+    hw(ts_hours(total),872,1296,21,187,'total','center')
+    if signature:
+        # Exact uploaded raster, never a generated or re-drawn signature.
+        im=_ts_Image.open(BytesIO(signature)); sw,sh=im.size
+        dw=min(266*k,108*k*sw/sh); dh=dw*sh/sw
+        c.drawImage(_ts_ImageReader(im),379*k,py(1404),dw,dh,mask='auto')
+    c.setFont('Helvetica',8); c.drawCentredString(w/2,py(1405),'Seite 1/1')
+    c.showPage();c.save()
+    return buf.getvalue()
+
+
+def ts_csrf_token() -> str:
+    if '_ts_csrf' not in session:
+        session['_ts_csrf']=secrets.token_urlsafe(32)
+    return session['_ts_csrf']
+
+
+def ts_verify_csrf() -> None:
+    expected=session.get('_ts_csrf',''); supplied=request.form.get('_ts_csrf','')
+    if not expected or not hmac.compare_digest(expected,supplied):
+        abort(400,description='Sesja formularza wygasła. Odśwież stronę i spróbuj ponownie.')
+
+
+@app.context_processor
+def ts_inject_globals():
+    return {'ts_csrf_token':ts_csrf_token,'ts_hours':ts_hours,'ts_settings':ts_settings}
+
+
+def ts_form_payload(invoice:dict,items:list,current:dict|None) -> tuple[dict,bytes|None]:
+    raw=request.form.get('rows_json','[]')
+    if len(raw)>30000: raise ValueError('Lista jest zbyt duża.')
+    try: rows=_ts_json.loads(raw)
+    except (ValueError,TypeError): raise ValueError('Nieprawidłowy zapis wierszy.') from None
+    if not isinstance(rows,list) or any(not isinstance(r,dict) for r in rows): raise ValueError('Nieprawidłowe wiersze listy.')
+    rows,total=ts_validate_rows(rows,request.form.get('period_start',''),request.form.get('period_end',''))
+    s=ts_settings()
+    signature=None;mode=request.form.get('signature_mode','none')
+    if mode=='keep' and current:
+        signature=_ts_b64.b64decode(current['payload'].get('signature_base64','')) or None
+    elif mode=='current':
+        if request.form.get('signature_consent')!='1':
+            raise ValueError('Potwierdź, że chcesz dodać swój zapisany podpis do tej listy.')
+        row=get_db().execute('SELECT signature_png FROM timesheet_settings WHERE id=1').fetchone()
+        signature=bytes(row['signature_png']) if row['signature_png'] else None
+        if not signature: raise ValueError('Najpierw wgraj swój podpis w Ustawienia → Listy godzin.')
+    elif mode!='none': raise ValueError('Nieprawidłowa opcja podpisu.')
+    payload={'schema':1,'style':TS_STYLE,'company_label':ts_text(request.form.get('company_label'),'Firma',60),
+             'worker_name':ts_text(request.form.get('worker_name'),'Imię i nazwisko',80),
+             'period_start':request.form.get('period_start'),'period_end':request.form.get('period_end'),
+             'project_number':ts_text(request.form.get('project_number'),'Projekt',80,False),
+             'show_project':request.form.get('show_project')=='1','rows':rows,'total_minutes':total,
+             'invoice_number':invoice['invoice_number'],'contractor_id':invoice['contractor_id'],
+             'invoice_fingerprint':ts_invoice_fingerprint(invoice,items),
+             'seed':current['payload'].get('seed') if current else secrets.token_hex(12),
+             'signature_base64':_ts_b64.b64encode(signature).decode() if signature else ''}
+    return payload,signature
+
+
+def ts_save_version(invoice_id:int,payload:dict,pdf:bytes,expected_revision:int) -> int:
+    db=get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        sheet=db.execute('SELECT * FROM timesheets WHERE invoice_id=?',(invoice_id,)).fetchone()
+        actual=sheet['current_revision'] if sheet else 0
+        if actual!=expected_revision:
+            raise ValueError('Lista została zmieniona w innym oknie. Odśwież stronę przed ponownym zapisem.')
+        if not sheet:
+            sheet_id=db.execute('INSERT INTO timesheets(invoice_id) VALUES(?)',(invoice_id,)).lastrowid
+        else: sheet_id=sheet['id']
+        rev=actual+1
+        db.execute('''INSERT INTO timesheet_versions(sheet_id,revision,payload_json,pdf_blob,pdf_sha256,total_minutes)
+                      VALUES(?,?,?,?,?,?)''',
+                   (sheet_id,rev,_ts_json.dumps(payload,ensure_ascii=False,sort_keys=True),pdf,
+                    _ts_hash.sha256(pdf).hexdigest(),payload['total_minutes']))
+        db.execute('UPDATE timesheets SET current_revision=? WHERE id=?',(rev,sheet_id));db.commit()
+        return rev
+    except Exception:
+        db.rollback();raise
+
+
+def ts_filename(payload:dict,revision:int) -> str:
+    number=re.sub(r'[^A-Za-z0-9._-]+','_',payload['invoice_number'])
+    return f'Stundenzettel_{number}_{payload["period_start"]}_{payload["period_end"]}_v{revision}.pdf'
+
+
+def ts_cached_file(invoice:dict,version:dict) -> None:
+    # Optional local archive. Authoritative, frozen PDF lives in SQLite and backup.
+    dest=invoice_pdf_destination(invoice).parent/'Listy_godzin'/ts_filename(version['payload'],version['revision'])
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    temp=dest.with_suffix('.tmp');temp.write_bytes(version['pdf_blob']);os.replace(temp,dest)
+
+
+@app.route('/invoices/<int:invoice_id>/timesheet',methods=['GET','POST'])
+def timesheet_edit(invoice_id:int):
+    invoice,items,totals=get_invoice_bundle(invoice_id)
+    sheet=get_db().execute('SELECT * FROM timesheets WHERE invoice_id=?',(invoice_id,)).fetchone()
+    current=ts_current(sheet); settings=ts_settings();errors=[]
+    if request.method=='POST':
+        ts_verify_csrf()
+        try:
+            payload,signature=ts_form_payload(invoice,items,current)
+            if request.form.get('intent')=='save' and request.form.get('reviewed')!='1':
+                raise ValueError('Potwierdź sprawdzenie rzeczywistych dat, godzin i przerw.')
+            pdf=ts_build_pdf(payload,signature)
+            if request.form.get('intent')=='preview':
+                return send_file(BytesIO(pdf),mimetype='application/pdf',download_name='Podglad_listy_godzin.pdf',as_attachment=False)
+            if request.form.get('intent')!='save': raise ValueError('Nieznana operacja.')
+            expected=ts_integer(request.form.get('revision','0'),'Wersja formularza',0,9999)
+            revision=ts_save_version(invoice_id,payload,pdf,expected)
+            version=ts_current(get_db().execute('SELECT * FROM timesheets WHERE invoice_id=?',(invoice_id,)).fetchone())
+            try: ts_cached_file(invoice,version)
+            except OSError: flash('Lista jest zapisana w bazie. Lokalny zapis dodatkowego PDF nie powiódł się.','error')
+            warning=ts_hours_warning(invoice,items,payload['total_minutes'])
+            flash(f'Zapisano listę: {ts_hours(payload["total_minutes"])}. Wersja {revision}. Faktura pozostaje bez zmian.','success')
+            if warning: flash(warning,'error')
+            return redirect(url_for('timesheet_edit',invoice_id=invoice_id))
+        except ValueError as exc: errors.append(str(exc))
+    if current:
+        form=dict(current['payload']); form['revision']=current['revision']
+        form['signature_mode']='keep' if form.get('signature_base64') else 'none'
+    else:
+        d=date.fromisoformat(invoice['supply_date']);monday=d-timedelta(days=d.weekday())
+        form={'company_label':settings['company_label'] if 'equans' in invoice.get('contractor_name','').casefold() else invoice.get('contractor_name',settings['company_label']),'worker_name':settings['worker_name'],
+              'period_start':monday.isoformat(),'period_end':(monday+timedelta(days=3)).isoformat(),
+              'project_number':invoice.get('order_number',''),'show_project':settings.get('show_project',False),
+              'rows':[],'revision':0,'signature_mode':'none'}
+        # Duplicating last list does not copy its signature/approvals; next form stays draft.
+        if request.args.get('copy')=='previous':
+            prior=get_db().execute('''SELECT v.payload_json FROM timesheets s
+                 JOIN timesheet_versions v ON v.sheet_id=s.id AND v.revision=s.current_revision
+                 JOIN invoices i ON i.id=s.invoice_id WHERE i.contractor_id=? AND i.id!=?
+                 ORDER BY v.id DESC LIMIT 1''',(invoice['contractor_id'],invoice_id)).fetchone()
+            if prior:
+                prev=_ts_json.loads(prior['payload_json']); offset=date.fromisoformat(form['period_start'])-date.fromisoformat(prev['period_start'])
+                form['period_end']=(date.fromisoformat(prev['period_end'])+offset).isoformat()
+                form['rows']=[dict(r,date=(date.fromisoformat(r['date'])+offset).isoformat()) for r in prev['rows']]
+                flash('Skopiowano dni i godziny na nowy okres. Sprawdź je; podpisu nie przeniesiono.','success')
+            else: flash('Brak wcześniejszej listy tego kontrahenta.','error')
+    if request.method=='POST':
+        for k in ('company_label','worker_name','period_start','period_end','project_number','signature_mode','revision'):
+            form[k]=request.form.get(k,form.get(k,''))
+        form['show_project']=request.form.get('show_project')=='1'
+        try:
+            parsed=_ts_json.loads(request.form.get('rows_json','[]'))
+            if isinstance(parsed,list) and len(parsed)<=31 and all(isinstance(r,dict) for r in parsed): form['rows']=parsed
+        except ValueError: pass
+    history=get_db().execute('SELECT id,revision,created_at,total_minutes FROM timesheet_versions WHERE sheet_id=? ORDER BY revision DESC',(sheet['id'],)).fetchall() if sheet else []
+    warning=ts_hours_warning(invoice,items,current['total_minutes']) if current else ''
+    changed=bool(current and current['payload'].get('invoice_fingerprint')!=ts_invoice_fingerprint(invoice,items))
+    return render_template('timesheet_form.html',invoice=invoice,form=form,ts_options=settings,
+                           current=current,history=history,errors=errors,hours_warning=warning,invoice_changed=changed)
+
+
+@app.route('/invoices/<int:invoice_id>/timesheet/pdf')
+def timesheet_pdf(invoice_id:int):
+    get_invoice_bundle(invoice_id)
+    sheet=get_db().execute('SELECT * FROM timesheets WHERE invoice_id=?',(invoice_id,)).fetchone()
+    current=ts_current(sheet)
+    if not current: abort(404)
+    return send_file(BytesIO(current['pdf_blob']),mimetype='application/pdf',
+                     download_name=ts_filename(current['payload'],current['revision']),
+                     as_attachment=request.args.get('inline')!='1')
+
+
+@app.route('/timesheets/revisions/<int:version_id>/pdf')
+def timesheet_revision_pdf(version_id:int):
+    row=get_db().execute('SELECT * FROM timesheet_versions WHERE id=?',(version_id,)).fetchone()
+    if not row: abort(404)
+    payload=_ts_json.loads(row['payload_json'])
+    return send_file(BytesIO(row['pdf_blob']),mimetype='application/pdf',
+                     download_name=ts_filename(payload,row['revision']),as_attachment=True)
+
+
+@app.route('/invoices/<int:invoice_id>/bundle')
+def invoice_timesheet_bundle(invoice_id:int):
+    invoice,items,totals=get_invoice_bundle(invoice_id)
+    current=ts_current(get_db().execute('SELECT * FROM timesheets WHERE invoice_id=?',(invoice_id,)).fetchone())
+    if not current: abort(404)
+    if current['payload']['invoice_fingerprint']!=ts_invoice_fingerprint(invoice,items) and request.args.get('confirm')!='1':
+        flash('Faktura zmieniła się od zapisu listy. Sprawdź listę i zapisz nową wersję przed pobraniem paczki.','error')
+        return redirect(url_for('timesheet_edit',invoice_id=invoice_id))
+    contractor={k:invoice.get('contractor_'+k,'') for k in ('name','address','postal_code','city','country','company_id','vat_id','email','phone')}
+    inv_pdf=build_invoice_pdf(get_company(),invoice,contractor,items).getvalue()
+    buf=BytesIO();n=re.sub(r'[^A-Za-z0-9._-]+','_',invoice['invoice_number'])
+    with _ts_zip.ZipFile(buf,'w',_ts_zip.ZIP_DEFLATED) as z:
+        z.writestr('Faktura_'+n+'.pdf',inv_pdf)
+        z.writestr(ts_filename(current['payload'],current['revision']),current['pdf_blob'])
+    buf.seek(0)
+    return send_file(buf,mimetype='application/zip',download_name='Faktura_i_godziny_'+n+'.zip',as_attachment=True)
+
+
+@app.route('/settings/timesheets',methods=['GET','POST'])
+def timesheet_settings_page():
+    errors=[];s=ts_settings();db=get_db()
+    if request.method=='POST':
+        ts_verify_csrf()
+        try:
+            action=request.form.get('action','save')
+            signature=None; replace_signature=False
+            if action=='import':
+                uploaded=request.files.get('config')
+                if uploaded is None: raise ValueError('Wybierz prywatny plik ustawień .json.')
+                raw=uploaded.read(2*1024*1024+1)
+                if len(raw)>2*1024*1024: raise ValueError('Plik ustawień jest za duży.')
+                try: data=_ts_json.loads(raw.decode('utf-8'))
+                except Exception: raise ValueError('Nieprawidłowy plik JSON.') from None
+                if not isinstance(data,dict) or data.get('format')!='FakturyOSVC-timesheets-1': raise ValueError('To nie jest plik ustawień list godzin.')
+                incoming=data.get('settings',{})
+                if not isinstance(incoming,dict): raise ValueError('Nieprawidłowe ustawienia.')
+                if data.get('signature_base64'):
+                    try: binary=_ts_b64.b64decode(data['signature_base64'],validate=True)
+                    except Exception: raise ValueError('Nieprawidłowy zapis podpisu.') from None
+                    if request.form.get('own_signature')!='1': raise ValueError('Potwierdź, że importowany podpis należy do Ciebie.')
+                    signature=ts_signature_clean(binary);replace_signature=True
+            else:
+                incoming=dict(request.form)
+                incoming['show_project']=request.form.get('show_project')=='1'
+                if request.form.get('remove_signature')=='1': replace_signature=True
+                image=request.files.get('signature')
+                if image and image.filename:
+                    if request.form.get('own_signature')!='1': raise ValueError('Potwierdź, że przesłany podpis należy do Ciebie.')
+                    signature=ts_signature_clean(image.read(TS_MAX_IMAGE+1));replace_signature=True
+            new={k:incoming.get(k,s[k]) for k in ('company_label','worker_name','default_start','default_end','default_break','thursday_end','thursday_break','show_project')}
+            new['company_label']=ts_text(new['company_label'],'Firma',60)
+            new['worker_name']=ts_text(new['worker_name'],'Imię i nazwisko',80)
+            for k in ('default_start','default_end','thursday_end'): ts_minutes(new[k])
+            new['default_break']=ts_integer(new['default_break'],'Domyślna przerwa',0,720)
+            new['thursday_break']=ts_integer(new['thursday_break'],'Przerwa w czwartek',0,720)
+            new['show_project']=bool(new['show_project']);new['style']=TS_STYLE
+            ts_validate_rows([{'date':'2026-10-05','start':new['default_start'],'end':new['default_end'],'break_minutes':new['default_break']}],'2026-10-05','2026-10-05')
+            ts_validate_rows([{'date':'2026-10-08','start':new['default_start'],'end':new['thursday_end'],'break_minutes':new['thursday_break']}],'2026-10-08','2026-10-08')
+            with db:
+                db.execute('UPDATE timesheet_settings SET options_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=1',(_ts_json.dumps(new,ensure_ascii=False),))
+                if replace_signature: db.execute('UPDATE timesheet_settings SET signature_png=? WHERE id=1',(signature,))
+            flash('Zapisano ustawienia list godzin. Istniejące PDF-y i podpisy w zapisanych wersjach nie zostały zmienione.','success')
+            return redirect(url_for('timesheet_settings_page'))
+        except ValueError as exc: errors.append(str(exc))
+    archives=db.execute('''SELECT v.id,v.revision,v.created_at,v.total_minutes,v.payload_json,i.invoice_number,i.id AS invoice_id
+        FROM timesheets s JOIN timesheet_versions v ON v.sheet_id=s.id AND v.revision=s.current_revision
+        LEFT JOIN invoices i ON i.id=s.invoice_id ORDER BY v.id DESC LIMIT 100''').fetchall()
+    return render_template('timesheet_settings.html',settings_tab='timesheets',ts_options=s,errors=errors,archives=archives)
+
+
+@app.route('/settings/timesheets/signature.png')
+def timesheet_signature_png():
+    row=get_db().execute('SELECT signature_png FROM timesheet_settings WHERE id=1').fetchone()
+    if not row or not row['signature_png']: abort(404)
+    return send_file(BytesIO(row['signature_png']),mimetype='image/png')
+
+
+@app.route('/settings/timesheets/sample.pdf')
+def timesheet_sample_pdf():
+    s=ts_settings(); rows=[]
+    for i in range(4):
+        rows.append({'date':f'2026-10-{5+i:02d}','start':s['default_start'],
+                     'end':s['thursday_end'] if i==3 else s['default_end'],
+                     'break_minutes':s['thursday_break'] if i==3 else s['default_break']})
+    p={'invoice_number':'PRÓBKA-NIE-DO-WYSYŁKI','company_label':s['company_label'],'worker_name':s['worker_name'],
+       'period_start':'2026-10-05','period_end':'2026-10-08','rows':rows,'show_project':False,'seed':'loose5-sample'}
+    # Sample intentionally unsigned; doesn't create records.
+    pdf=ts_build_pdf(p)
+    return send_file(BytesIO(pdf),mimetype='application/pdf',as_attachment=False,download_name='Probka_styl_5.pdf')
+
+@app.before_request
+def ts_require_cloud_auth_configuration():
+    if CLOUD_MODE and not APP_PASSWORD and (str(request.endpoint or '').startswith(('timesheet','ts_')) or request.endpoint=='invoice_timesheet_bundle'):
+        abort(503,description='Ustaw APP_PASSWORD przed udostępnieniem list godzin i podpisu w chmurze.')
+
+
+# V8.4 interface: same navigation, new settings sub-tab and per-invoice action.
+EMBEDDED_TEMPLATES['timesheet_form.html'] = r'''{% extends 'base.html' %}
+{% block title %}Lista godzin — {{ invoice.invoice_number }}{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Lista godzin</h1><p class="muted">{{ invoice.invoice_number }} · {{ invoice.contractor_name }} · styl 5, niebieski długopis</p></div><div class="button-row"><a class="btn btn-light" href="{{ url_for('invoice_view',invoice_id=invoice.id) }}">Wróć do faktury</a><a class="btn btn-light" href="{{ url_for('timesheet_settings_page') }}">Ustawienia list</a></div></div>
+{% for error in errors %}<div class="callout warning" role="alert">{{ error }}</div>{% endfor %}
+{% if invoice_changed %}<div class="callout warning">Faktura została zmieniona od zapisu listy. Zapisany PDF pozostaje niezmienny; sprawdź zgodność i zapisz nową wersję.</div>{% endif %}
+{% if hours_warning %}<div class="callout warning">{{ hours_warning }}</div>{% endif %}
+{% if current %}<section class="panel ts-saved"><div><strong>Zapisana wersja {{ current.revision }} · {{ ts_hours(current.total_minutes) }}</strong><p class="muted">{{ current.created_at }}. Ten PDF zawiera wpisy i podpis z chwili zapisu.</p></div><div class="button-row"><a class="btn btn-primary" href="{{ url_for('timesheet_pdf',invoice_id=invoice.id) }}">Pobierz listę PDF</a><a class="btn btn-light" href="{{ url_for('invoice_timesheet_bundle',invoice_id=invoice.id) }}">Faktura + lista (ZIP)</a></div></section>{% endif %}
+<form method="post" class="panel form-panel" id="ts-form" data-defaults='{{ ts_options|tojson }}'>
+<input type="hidden" name="_ts_csrf" value="{{ ts_csrf_token() }}"><input type="hidden" name="revision" value="{{ form.revision }}">
+<input type="hidden" name="rows_json" id="ts-rows-json" value='{{ form.rows|tojson }}'>
+<h2>Dane listy</h2>
+<div class="form-grid three">
+<label class="field"><span>Firma na liście</span><input name="company_label" value="{{ form.company_label }}" required maxlength="60"></label>
+<label class="field span-2"><span>Imię i nazwisko</span><input name="worker_name" value="{{ form.worker_name }}" required maxlength="80"></label>
+<label class="field"><span>Od</span><input type="date" name="period_start" id="ts-from" value="{{ form.period_start }}" required></label>
+<label class="field"><span>Do</span><input type="date" name="period_end" id="ts-to" value="{{ form.period_end }}" required></label>
+<label class="field"><span>Projekt / zamówienie</span><input name="project_number" value="{{ form.project_number }}" maxlength="80"></label>
+<label class="checkbox-row span-3"><input type="checkbox" name="show_project" value="1" {% if form.show_project %}checked{% endif %}>Drukuj projekt nad tabelą (opcjonalnie)</label>
+</div>
+<div class="ts-section-title"><div><h2>Dni pracy</h2><p class="muted">Przerwa w minutach. Praca netto = koniec − początek − przerwa.</p></div><div class="button-row"><button class="btn btn-light" id="ts-week" type="button">Wstaw pon.–czw.</button><button class="btn btn-light" id="ts-add" type="button">+ Dodaj dzień</button>{% if not current %}<a class="btn btn-light" href="{{ url_for('timesheet_edit',invoice_id=invoice.id,copy='previous') }}">Kopiuj poprzednią listę</a>{% endif %}</div></div>
+<p class="ts-inline-warning" id="ts-row-error" role="alert"></p>
+<div id="ts-rows" class="ts-rows"></div>
+<div class="ts-total"><span>Razem po odjęciu przerw</span><strong id="ts-total-text">0 h</strong></div>
+<h2>Podpis</h2>
+<label class="field"><span>Podpis w tym dokumencie</span><select name="signature_mode" id="ts-signature-mode">
+<option value="none" {% if form.signature_mode=='none' %}selected{% endif %}>Bez podpisu</option>
+{% if current and current.payload.signature_base64 %}<option value="keep" {% if form.signature_mode=='keep' %}selected{% endif %}>Zachowaj podpis z zapisanej wersji</option>{% endif %}
+{% if ts_options.has_signature %}<option value="current" {% if form.signature_mode=='current' %}selected{% endif %}>Dodaj mój podpis zapisany w ustawieniach</option>{% endif %}
+</select></label>
+{% if not ts_options.has_signature %}<p class="muted">Podpis wgrywasz jednorazowo w <a href="{{ url_for('timesheet_settings_page') }}">Ustawienia → Listy godzin</a>. Nie jest umieszczany w publicznym kodzie aplikacji.</p>{% endif %}
+<label class="checkbox-row" id="ts-signature-consent"><input type="checkbox" name="signature_consent" value="1">Potwierdzam użycie mojego zapisanego podpisu na tej liście.</label>
+<label class="checkbox-row ts-reviewed"><input type="checkbox" name="reviewed" value="1">Sprawdziłem rzeczywiste daty, godziny i przerwy. Chcę zapisać tę wersję listy.</label>
+<p class="muted">Wpisy są elektronicznie stylizowane na pismo ręczne. Zapis nie zmienia godzin ani kwoty faktury. Zmiana ustawień nie modyfikuje starszych PDF-ów.</p>
+<div class="form-actions"><button type="submit" name="intent" value="preview" formtarget="_blank" class="btn btn-light">Podgląd PDF</button><button type="submit" name="intent" value="save" class="btn btn-primary">Zapisz {{ 'nową wersję' if current else 'listę' }}</button></div>
+</form>
+{% if history %}<section class="panel"><h2>Historia zapisanych wersji</h2><p class="muted">Poprzednie dokumenty pozostają dostępne również po edycji listy.</p><div class="table-wrap"><table><thead><tr><th>Wersja</th><th>Zapisano</th><th>Godziny netto</th><th>PDF</th></tr></thead><tbody>{% for v in history %}<tr><td>{{ v.revision }}</td><td>{{ v.created_at }}</td><td>{{ ts_hours(v.total_minutes) }}</td><td><a href="{{ url_for('timesheet_revision_pdf',version_id=v.id) }}">Pobierz</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+{% endblock %}'''
+
+EMBEDDED_TEMPLATES['timesheet_settings.html'] = r'''{% extends 'base.html' %}
+{% block title %}Listy godzin — Ustawienia{% endblock %}
+{% block content %}
+{% include 'settings_tabs.html' %}
+<div class="page-header"><div><h1>Listy godzin</h1><p class="muted">Szablon EQUANS · styl nr 5 — luźny · PDF A4 po niemiecku</p></div><a class="btn btn-light" target="_blank" href="{{ url_for('timesheet_sample_pdf') }}">Próbka stylu (bez podpisu)</a></div>
+{% for error in errors %}<div class="callout warning" role="alert">{{ error }}</div>{% endfor %}
+<div class="callout info">Listę tworzysz na stronie zapisanej faktury przyciskiem „Lista godzin”. Ustawienia poniżej są wartościami domyślnymi; nie zmieniają istniejących list.</div>
+<form method="post" enctype="multipart/form-data" class="panel form-panel ts-settings-form">
+<input type="hidden" name="_ts_csrf" value="{{ ts_csrf_token() }}"><input type="hidden" name="action" value="save">
+<h2>Wpisy domyślne</h2><div class="form-grid two">
+<label class="field"><span>Firma na formularzu</span><input name="company_label" value="{{ ts_options.company_label }}" maxlength="60" required></label>
+<label class="field"><span>Imię i nazwisko</span><input name="worker_name" value="{{ ts_options.worker_name }}" maxlength="80" required></label>
+<label class="field"><span>Początek pracy</span><input type="time" name="default_start" value="{{ ts_options.default_start }}" required></label>
+<label class="field"><span>Koniec pon.–śr.</span><input type="time" name="default_end" value="{{ ts_options.default_end }}" required></label>
+<label class="field"><span>Przerwa pon.–śr. (min)</span><input type="number" min="0" max="720" name="default_break" value="{{ ts_options.default_break }}" required></label>
+<label class="field"><span>Koniec w czwartek</span><input type="time" name="thursday_end" value="{{ ts_options.thursday_end }}" required></label>
+<label class="field"><span>Przerwa w czwartek (min)</span><input type="number" min="0" max="720" name="thursday_break" value="{{ ts_options.thursday_break }}" required></label>
+<label class="field"><span>Wygląd</span><input value="Styl 5 · luźne pismo · niebieski długopis" readonly></label>
+<label class="checkbox-row span-2"><input type="checkbox" name="show_project" value="1" {% if ts_options.show_project %}checked{% endif %}>Domyślnie drukuj numer projektu</label></div>
+<h2>Mój podpis</h2><p class="muted">Wgraj przycięty obraz własnego podpisu, bez otaczającego dokumentu. PNG z przezroczystym tłem daje najlepszy rezultat. Podpis przechowywany jest w bazie, nie na GitHubie.</p>
+{% if ts_options.has_signature %}<img class="ts-sign-preview" src="{{ url_for('timesheet_signature_png') }}" alt="Twój zapisany podpis"><label class="checkbox-row"><input type="checkbox" name="remove_signature" value="1">Usuń domyślny podpis (nie usuwa podpisów ze starych zapisanych PDF-ów)</label>{% endif %}
+<label class="field"><span>Podpis PNG/JPG/WEBP, maks. 2 MB</span><input type="file" name="signature" accept="image/png,image/jpeg,image/webp"></label>
+<label class="checkbox-row"><input type="checkbox" name="own_signature" value="1">Potwierdzam, że przesłany podpis jest moim własnym podpisem.</label>
+<p class="muted">Każde dodanie podpisu do nowej listy wymaga osobnego zatwierdzenia. Kopiowanie poprzedniej listy nie kopiuje jej podpisu.</p>
+<button class="btn btn-primary" type="submit">Zapisz ustawienia list</button>
+</form>
+<section class="panel"><h2>Jednorazowy import prywatnej konfiguracji</h2><p>Możesz zaimportować przygotowany plik ustawień z Twoim podpisem. Nie wgrywaj tego pliku na GitHub ani do publicznego bucketa.</p>
+<form method="post" enctype="multipart/form-data" class="ts-settings-form"><input type="hidden" name="_ts_csrf" value="{{ ts_csrf_token() }}"><input type="hidden" name="action" value="import"><label class="field"><span>Plik konfiguracji .json</span><input type="file" name="config" accept=".json" required></label><label class="checkbox-row"><input type="checkbox" name="own_signature" value="1" required>Potwierdzam, że podpis w konfiguracji należy do mnie.</label><button class="btn btn-light" type="submit">Importuj ustawienia i podpis</button></form></section>
+{% if archives %}<section class="panel"><h2>Zapisane listy</h2><div class="table-wrap"><table><thead><tr><th>Faktura</th><th>Wersja</th><th>Godziny</th><th>Dokument</th></tr></thead><tbody>{% for a in archives %}<tr><td>{% if a.invoice_id %}<a href="{{ url_for('timesheet_edit',invoice_id=a.invoice_id) }}">{{ a.invoice_number }}</a>{% else %}Odłączona lista — faktura usunięta{% endif %}</td><td>{{ a.revision }}</td><td>{{ ts_hours(a.total_minutes) }}</td><td><a href="{{ url_for('timesheet_revision_pdf',version_id=a.id) }}">PDF</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+{% endblock %}'''
+
+# Append dedicated settings tab; do not move any existing tab.
+_ts_link = ''' <a class="{% if settings_tab|default('') == 'timesheets' %}active{% endif %}" href="{{ url_for('timesheet_settings_page') }}">Listy godzin</a>'''
+EMBEDDED_TEMPLATES['settings_tabs.html'] = EMBEDDED_TEMPLATES['settings_tabs.html'].replace('</nav>', _ts_link+'\n</nav>',1)
+# The action is available on every invoice (default template EQUANS), without
+# matching a contractor by mutable name or changing any contractor record.
+_ts_invoice_action = '''
+<section class="panel ts-saved"><div><h2>Lista godzin / Stundenzettel</h2><p class="muted">Szablon EQUANS, niebieskie wpisy w stylu 5 i Twój zatwierdzony podpis.</p></div><a class="btn btn-light" href="{{ url_for('timesheet_edit',invoice_id=invoice.id) }}">Lista godzin</a></section>
+'''
+EMBEDDED_TEMPLATES['invoice_detail.html'] = EMBEDDED_TEMPLATES['invoice_detail.html'].replace('{% block content %}','{% block content %}'+_ts_invoice_action,1)
+
+EMBEDDED_CSS += r'''
+/* V8.4 timesheets */
+#ts-form .checkbox-row,.ts-settings-form .checkbox-row{display:flex;flex-direction:row;align-items:flex-start;gap:10px;margin:12px 0;line-height:1.4}
+#ts-form .checkbox-row input[type=checkbox],.ts-settings-form .checkbox-row input[type=checkbox]{width:18px;min-width:18px;height:18px;padding:0;flex:0 0 18px;margin:1px 0 0}
+#ts-signature-consent[hidden]{display:none!important}
+
+.ts-saved,.ts-section-title{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.ts-section-title{margin:26px 0 12px}.ts-section-title h2{margin-bottom:4px}
+.ts-row{display:grid;grid-template-columns:1.3fr 1fr 1fr .8fr 1fr auto;align-items:end;gap:10px;padding:14px 0;border-bottom:1px solid #e2e8f0}
+.ts-row .field{min-width:0;margin:0}.ts-row input{width:100%;min-width:0;box-sizing:border-box}
+.ts-row-total{align-self:center;font-weight:750;font-size:18px;white-space:nowrap}
+.ts-row-extra{grid-column:1/-1;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.ts-total{margin:20px 0;padding:18px;border-radius:12px;background:#f4eff2;display:flex;justify-content:space-between;align-items:center;gap:12px}.ts-total strong{font-size:26px;color:#811737}
+.ts-inline-warning{color:#a42727;min-height:1em}.ts-sign-preview{display:block;max-width:300px;max-height:150px;border:1px solid #eee;margin:12px 0;background:#fff}
+.ts-reviewed{margin:20px 0;font-weight:650}.ts-row .ts-delete{align-self:center}
+@media(max-width:700px){.ts-row{grid-template-columns:1fr 1fr;border:1px solid #d8e0e9;border-radius:12px;margin:12px 0;padding:14px}.ts-row .field:first-child{grid-column:1/-1}.ts-row-total{font-size:22px}.ts-row-extra{grid-column:1/-1}.ts-saved .button-row{width:100%}.ts-saved .button-row a{flex:1}.ts-section-title .button-row{display:flex;flex-direction:column;align-items:stretch}.ts-row input[type=date],.ts-row input[type=time]{font-size:16px!important}.ts-total strong{font-size:22px}}
+'''
+
+EMBEDDED_JS += r'''
+document.addEventListener('DOMContentLoaded',()=>{
+const form=document.getElementById('ts-form');if(!form)return;
+const host=document.getElementById('ts-rows'), hidden=document.getElementById('ts-rows-json');
+const defs=JSON.parse(form.dataset.defaults), err=document.getElementById('ts-row-error');
+let rows=JSON.parse(hidden.value||'[]');
+function isoAdd(s,n){const d=new Date(s+'T12:00:00Z');if(isNaN(d))return '';d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10)}
+function mins(t){if(!/^\d{2}:\d{2}$/.test(t||''))return NaN;let [h,m]=t.split(':').map(Number);return h<24&&m<60?h*60+m:NaN}
+function net(r){let n=mins(r.end)-mins(r.start)+(r.next_day?1440:0)-Number(r.break_minutes);return Number.isFinite(n)&&n>0&&n<=1440&&Number(r.break_minutes)>=0?n:NaN}
+function format(n){if(!Number.isFinite(n))return 'Sprawdź';return n%15===0?(n/60).toLocaleString('pl-PL')+' h':Math.floor(n/60)+' h '+String(n%60).padStart(2,'0')+' min'}
+function sync(){hidden.value=JSON.stringify(rows);let sum=0,bad=false;rows.forEach((r,i)=>{let n=net(r);if(!Number.isFinite(n))bad=true;else sum+=n;const el=host.querySelector('[data-total="'+i+'"]');if(el)el.textContent=format(n)});document.getElementById('ts-total-text').textContent=format(sum);err.textContent=bad?'Sprawdź godziny i długość przerw w zaznaczonych dniach.':''}
+function field(label,type,key,value,i){const l=document.createElement('label');l.className='field';const s=document.createElement('span');s.textContent=label;l.append(s);const input=document.createElement('input');input.type=type;input.value=value??'';input.required=true;if(type==='number'){input.min='0';input.max='1439';input.step='1'}input.addEventListener('input',()=>{rows[i][key]=type==='number'?input.value:input.value;sync()});l.append(input);return l}
+function render(){host.replaceChildren();rows.forEach((r,i)=>{const row=document.createElement('div');row.className='ts-row';row.append(field('Data','date','date',r.date,i),field('Od','time','start',r.start,i),field('Do','time','end',r.end,i),field('Przerwa (min)','number','break_minutes',r.break_minutes,i));const total=document.createElement('div');total.className='ts-row-total';total.dataset.total=i;row.append(total);const del=document.createElement('button');del.type='button';del.className='btn btn-light btn-small ts-delete';del.textContent='Usuń';del.addEventListener('click',()=>{rows.splice(i,1);render()});row.append(del);const extra=document.createElement('div');extra.className='ts-row-extra';const l=document.createElement('label');l.className='checkbox-row';const ck=document.createElement('input');ck.type='checkbox';ck.checked=!!r.next_day;ck.addEventListener('change',()=>{r.next_day=ck.checked;sync()});l.append(ck,document.createTextNode('Koniec następnego dnia'));extra.append(l);const copy=document.createElement('button');copy.type='button';copy.className='btn btn-light btn-small';copy.textContent='Kopiuj na kolejny dzień';copy.addEventListener('click',()=>{if(rows.length>=31){err.textContent='Maksymalnie 31 dni.';return}const nd=isoAdd(r.date,1);if(rows.some(x=>x.date===nd)){err.textContent='Kolejny dzień jest już na liście.';return}rows.splice(i+1,0,{...r,date:nd});if(nd>document.getElementById('ts-to').value)document.getElementById('ts-to').value=nd;render()});extra.append(copy);row.append(extra);host.append(row)});sync()}
+document.getElementById('ts-add').addEventListener('click',()=>{if(rows.length>=31){err.textContent='Maksymalnie 31 dni.';return}const date=rows.length?isoAdd(rows[rows.length-1].date,1):document.getElementById('ts-from').value;rows.push({date,start:defs.default_start,end:defs.default_end,break_minutes:defs.default_break,next_day:false});if(date>document.getElementById('ts-to').value)document.getElementById('ts-to').value=date;render()});
+document.getElementById('ts-week').addEventListener('click',()=>{if(rows.length&&!confirm('Zastąpić wpisane dni domyślnym poniedziałkiem–czwartkiem?'))return;const s=document.getElementById('ts-from').value;let d=new Date(s+'T12:00:00Z');if(isNaN(d)){err.textContent='Wybierz datę początku.';return}const delta=(d.getUTCDay()+6)%7,monday=isoAdd(s,-delta);document.getElementById('ts-from').value=monday;document.getElementById('ts-to').value=isoAdd(monday,3);rows=Array.from({length:4},(_,i)=>({date:isoAdd(monday,i),start:defs.default_start,end:i===3?defs.thursday_end:defs.default_end,break_minutes:i===3?defs.thursday_break:defs.default_break,next_day:false}));render()});
+form.addEventListener('submit',e=>{sync();if(e.submitter&&e.submitter.value==='save'&&!form.querySelector('[name=reviewed]').checked){e.preventDefault();err.textContent='Potwierdź sprawdzenie dat, godzin i przerw przed zapisem.'}});
+function signMode(){document.getElementById('ts-signature-consent').hidden=document.getElementById('ts-signature-mode').value!=='current'}
+document.getElementById('ts-signature-mode').addEventListener('change',signMode);signMode();render();
+});
+'''
+
 # V8: wykonuj automatyczny backup dopiero po zdefiniowaniu wszystkich funkcji.
 with app.app_context():
+    ts_backup_before_migration()
+    v83_backup_before_migration()
+    v82_backup_before_migration()
+    init_db()
+    init_tax_module()
+    init_prop_firms_module()
+    init_v82_module()
+    init_v83_module()
+    init_timesheets_module()
     ensure_daily_backup()
+    if REMOTE_DB_ENABLED and not upload_remote_database():
+        raise RuntimeError("Nie udało się zapisać aktualizacji bazy w Supabase. Start zatrzymany; kopia lokalna zachowana.")
 
 
 def run_v8_1_self_tests() -> list[str]:
@@ -5229,15 +6768,174 @@ def run_v8_1_self_tests() -> list[str]:
     results.append("OK: migracja Lucid Trading → LucidFlex zachowuje payouty i ustawia rekomendowany status")
     return results
 
+def run_v82_self_tests() -> list[str]:
+    results = run_v8_1_self_tests()
+    parameters = CONTRIBUTION_PARAMETER_DEFAULTS[2027]
+    options = {'vzp_minimum_applies': 1, 'cssz_advance_exempt': 0, 'vzp_advance_exempt': 0}
+    estimate = estimate_next_advances(Decimal('68648.81'), 6, 6, parameters, options)
+    assert (estimate['cssz'], estimate['vzp']) == (Decimal('5281'), Decimal('3488'))
+    results.append('OK: prognoza minimalnych zaliczek 2027: ČSSZ 5281 / VZP 3488')
+    six = estimate_next_advances(Decimal('320000'), 6, 6, parameters, options)
+    twelve = estimate_next_advances(Decimal('320000'), 12, 12, parameters, options)
+    assert (six['cssz'], six['vzp']) == (Decimal('8566'), Decimal('3600'))
+    assert six['cssz'] > twelve['cssz']
+    results.append('OK: uwzględniono łączną liczbę miesięcy hlavní + vedlejší; brak dzielenia niepełnego roku przez 12')
+    maximum = estimate_next_advances(Decimal('10000000'), 6, 6, parameters, options)
+    assert maximum['cssz'] == ceil_whole(Decimal(parameters['cssz_max_base']) * Decimal('.292'))
+    exempt = estimate_next_advances(Decimal('320000'), 6, 6, parameters,
+                                    {**options, 'cssz_advance_exempt': 1, 'vzp_advance_exempt': 1})
+    assert exempt['total'] == 0
+    results.append('OK: maksimum ČSSZ, brak maksimum VZP i jawne zwolnienia z zaliczek')
+    with app.test_request_context('/'):
+        assert url_for('contractors_list') == '/settings/contractors'
+        assert url_for('projects_list') == '/settings/projects'
+    with app.test_client() as client:
+        for url in ('/settings?year=2026', '/settings?year=2026&tab=forecast',
+                    '/settings/contractors', '/settings/projects', '/taxes?year=2026'):
+            response = client.get(url)
+            assert response.status_code == 200, (url, response.status_code)
+        response = client.post('/settings/contributions/forecast', data={
+            'source_year': '2026', 'additional_revenue_60': '500000',
+            'additional_revenue_40': '0', 'vzp_minimum_applies': '1',
+        })
+        assert response.status_code == 302
+        response = client.get('/settings?year=2026&tab=forecast')
+        assert response.status_code == 200
+    results.append('OK: strony i zapis scenariusza przez test_client (wyłącznie tymczasowa baza testowa)')
+    return results
+
+
+def run_v83_self_tests() -> list[str]:
+    """Runs only under --self-test, in the existing isolated test database."""
+    from unittest.mock import patch
+    results = run_v82_self_tests()
+    text = ('02.10.2026 #190\nzemě|měna|množství|kód|kurz\n'
+            'EMU|euro|1|EUR|24,500\nUSA|dolar|1|USD|21,000\n'
+            'Japonsko|jen|100|JPY|14,200\nIndonesie|rupie|1000|IDR|1,330\n')
+    parsed = parse_cnb_daily_text(text)
+    assert Decimal(parsed['rates']['JPY']['rate']) == Decimal('.142')
+    assert Decimal(parsed['rates']['IDR']['rate']) == Decimal('.00133')
+    assert fx_publication_date(date(2026,10,4)) == date(2026,10,2)
+    assert fx_publication_date(date(2026,9,28)) == date(2026,9,25)
+    assert fx_publication_date(date(2026,4,6)) == date(2026,4,2)
+    results.append('OK: format TXT ČNB, jednostki 100/1000, weekend, święto i Wielkanoc')
+    for malformed in ('<html>ERROR</html>', text.replace('24,500','NaN')):
+        try:
+            parse_cnb_daily_text(malformed)
+        except FxError:
+            pass
+        else:
+            raise AssertionError('Przyjęto nieprawidłową tabelę')
+    class FixtureResponse:
+        def __init__(self, url, body): self.url, self.body = url, body
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def geturl(self): return self.url
+        def read(self, *args): return self.body.encode('utf-8')
+    def fixture_http(req, **kwargs):
+        day = urllib.parse.parse_qs(urllib.parse.urlparse(req.full_url).query)['date'][0]
+        body = text.replace('02.10.2026', day)
+        if day == '05.10.2026': body = body.replace('24,500', '25,000')
+        return FixtureResponse(req.full_url, body)
+    _FX_CACHE.clear()
+    with patch(__name__+'.fx_today', return_value=date(2026,10,8)), patch('urllib.request.urlopen', side_effect=fixture_http) as transport:
+        quote = fetch_cnb_rate('EUR', '2026-10-04')
+        assert quote['published_date'] == '2026-10-02'
+        count = transport.call_count
+        fetch_cnb_rate('USD','2026-10-04')
+        assert transport.call_count == count
+        for currency, day in [('USDT','2026-10-02'), ('USDC','2026-10-02'), ('EUR','2026-10-09')]:
+            try: fetch_cnb_rate(currency,day)
+            except FxError: pass
+            else: raise AssertionError('Przyjęto token / kurs z przyszłości')
+        with app.app_context():
+            db = get_db()
+            contractor_id = db.execute("INSERT INTO contractors(name,vat_id) VALUES ('TEST FX','ATU12345678')").lastrowid
+            db.commit()
+        with app.test_client() as client:
+            response = client.post('/invoices/new',data={
+                'contractor_id':str(contractor_id), 'issue_date':'2026-10-02','supply_date':'2026-10-02',
+                'due_date':'2026-10-16','currency':'EUR','language':'de','tax_mode':'reverse_charge',
+                'payment_method':'bank_transfer','dph_category':'review','fx_mode':'cnb','fx_date':'2026-10-02',
+                'czk_rate':'99999','item_description':'TEST FX','item_quantity':'1','item_unit':'h',
+                'item_unit_price':'1000','item_vat_rate':'0'})
+            assert response.status_code == 302
+            with app.app_context():
+                row = get_db().execute('SELECT * FROM invoices ORDER BY id DESC LIMIT 1').fetchone()
+                invoice_id = row['id']
+                assert Decimal(row['czk_rate']) == Decimal('24.5')
+                assert fx_quote('invoice',invoice_id)['source'] == 'cnb'
+            response = client.post(f'/invoices/{invoice_id}/payment',data={'paid_date':'2026-10-05','fx_mode':'cnb','czk_rate':'9999'})
+            assert response.status_code == 302
+            with app.app_context():
+                row = get_db().execute('SELECT * FROM invoices WHERE id=?',(invoice_id,)).fetchone()
+                assert Decimal(row['czk_rate']) == Decimal('24.5')
+                assert Decimal(fx_quote('invoice',invoice_id,'payment')['rate']) == Decimal('25')
+                rows, _ = tax_invoice_rows(2026,'paid')
+                assert next(r for r in rows if r['id'] == invoice_id)['value_czk'] == Decimal('25000')
+            for url in ('/settings/exchange-rates',f'/invoices/{invoice_id}/payment', f'/invoices/{invoice_id}/edit'):
+                assert client.get(url).status_code == 200
+        results.append('OK: serwer zapisuje kurs CNB zamiast podmienionej wartości; oddzielny kurs PIT bez zmiany kursu DPH')
+    _FX_CACHE.clear()
+    results.append('OK: cache, odrzucenie kursów przyszłych / tokenów; testy transportu na kontrolowanych danych, bez live API')
+    return results
+
+
+def run_v84_self_tests() -> list[str]:
+    results = run_v83_self_tests()
+    rows = [{'date':f'2026-10-{5+i:02d}','start':'06:30','end':'13:00' if i==3 else '17:00',
+             'break_minutes':0 if i==3 else 30} for i in range(4)]
+    assert ts_validate_rows(rows,'2026-10-05','2026-10-08')[1] == 2190
+    assert ts_validate_rows([dict(r,break_minutes=30) for r in rows],'2026-10-05','2026-10-08')[1] == 2160
+    for bad in ([rows[0],rows[0]],[dict(rows[0],break_minutes=631)],[dict(rows[0],end='05:30')]):
+        try:
+            ts_validate_rows(bad,'2026-10-05','2026-10-08')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Zaakceptowano nieprawidłowe godziny')
+    results.append('OK: 36,5h / 36h; odrzucenie powtórzonych dat i błędnych przerw')
+    with app.app_context():
+        db=get_db()
+        cid=db.execute("INSERT INTO contractors(name) VALUES('TEST EQUANS')").lastrowid
+        iid=db.execute('''INSERT INTO invoices(invoice_number,invoice_year,sequence_no,contractor_id,
+             issue_date,supply_date,due_date,currency,czk_rate,tax_mode)
+             VALUES(?,2026,9000,?,'2026-10-08','2026-10-08','2026-10-22','CZK','1','no_vat')''',
+             ('TEST-TS-'+secrets.token_hex(4),cid)).lastrowid
+        db.execute("INSERT INTO invoice_items(invoice_id,position,description,quantity,unit,unit_price) VALUES(?,1,'TEST','36.5','h','500')",(iid,))
+        db.commit()
+    with app.test_client() as client:
+        assert client.get(f'/invoices/{iid}/timesheet').status_code==200
+        with client.session_transaction() as s: token=s['_ts_csrf']
+        data={'_ts_csrf':token,'intent':'save','revision':'0','company_label':'TEST EQUANS',
+              'worker_name':'Jan Kowalski','period_start':'2026-10-05','period_end':'2026-10-08',
+              'project_number':'TEST-PROJECT','rows_json':_ts_json.dumps(rows),'signature_mode':'none','reviewed':'1'}
+        assert client.post(f'/invoices/{iid}/timesheet',data=data).status_code==302
+        first=client.get(f'/invoices/{iid}/timesheet/pdf').data
+        assert first.startswith(b'%PDF')
+        assert client.get(f'/invoices/{iid}/bundle').status_code==200
+        data['revision']='1';data['rows_json']=_ts_json.dumps([dict(r,break_minutes=30) for r in rows])
+        assert client.post(f'/invoices/{iid}/timesheet',data=data).status_code==302
+        with app.app_context():
+            versions=get_db().execute('''SELECT v.* FROM timesheet_versions v JOIN timesheets s ON s.id=v.sheet_id
+                    WHERE s.invoice_id=? ORDER BY revision''',(iid,)).fetchall()
+            assert len(versions)==2 and versions[0]['pdf_blob']==first and versions[1]['total_minutes']==2160
+        assert client.post(f'/invoices/{iid}/timesheet',data=dict(data,_ts_csrf='bad')).status_code==400
+        for path in ('/settings/timesheets',f'/invoices/{iid}',f'/invoices/{iid}/timesheet'):
+            assert client.get(path).status_code==200,path
+    results.append('OK: Flask GET/POST, zapis, wersjonowanie PDF, ZIP, CSRF, strona ustawień')
+    return results
+
+
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        for result in run_v8_1_self_tests():
+        for result in run_v84_self_tests():
             print(result)
         raise SystemExit(0)
     if MIGRATED_FROM:
         print(f"Zaimportowano dane ze starej aplikacji: {MIGRATED_FROM}")
         print(f"Nowa baza danych: {DB_PATH}")
-    print("Faktury OSVČ V8.1 Prop Firmy + LucidFlex Web/PWA")
+    print("Faktury OSVČ V8.4 — Listy godzin, styl 5 + kursy ČNB Web/PWA")
     print(f"Baza danych: {DB_PATH}")
     print(f"Faktury PDF: {INVOICE_PDF_DIR}")
     print(f"Supabase configured: {REMOTE_DB_ENABLED}; bucket={SUPABASE_BUCKET}; key_kind={SUPABASE_KEY_KIND}")

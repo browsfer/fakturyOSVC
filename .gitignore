@@ -1,6 +1,23 @@
 __pycache__/
 *.pyc
 .env
-invoice_app.db
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db-*
+data/
 backups/
 invoices/
+*.log
+
+# Prywatne dane list godzin i podpisu
+PRYWATNE*.json
+*podpis*.png
+*signature*.png
+*.sqlite
+*.sqlite3
+*.db
+.env
+private/
