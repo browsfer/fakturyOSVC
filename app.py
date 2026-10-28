@@ -7,6 +7,7 @@ import subprocess
 import sys
 import calendar
 import csv
+import zipfile
 import xml.etree.ElementTree as ET
 
 
@@ -270,7 +271,7 @@ EMBEDDED_TEMPLATES = {'404.html': '{% extends "base.html" %}\n'
                          '        <label class="field span-2"><span>Nazwa firmy *</span><input name="name" value="{{ '
                          'contractor.name }}" required autofocus></label>\n'
                          '        <label class="field"><span>VAT ID / UID</span><input name="vat_id" value="{{ '
-                         'contractor.vat_id }}" placeholder="ATU12345678"></label>\n'
+                         'contractor.vat_id }}" placeholder="ATU00000000"></label>\n'
                          '        <label class="field"><span>Numer firmy</span><input name="company_id" value="{{ '
                          'contractor.company_id }}"></label>\n'
                          '        <label class="field span-2"><span>Ulica i numer</span><input name="address" '
@@ -1349,6 +1350,7 @@ EMBEDDED_TEMPLATES["prop_firms.html"] = r"""{% extends "base.html" %}
     <p class="muted">Ewidencja rzeczywiście otrzymanych payoutów. Wirtualny wynik rachunku nie jest tu przychodem.</p>
   </div>
   <div class="button-row">
+    <a class="btn btn-light" href="{{ url_for('accountant_export', year=selected_year) }}">Pakiet dla księgowego</a>
     <a class="btn btn-light" href="{{ url_for('prop_firm_new') }}">+ Dodaj firmę</a>
     <a class="btn btn-primary" href="{{ url_for('prop_payout_new') }}">+ Dodaj payout</a>
   </div>
@@ -1494,7 +1496,7 @@ EMBEDDED_TEMPLATES["taxes_dashboard.html"] = r"""{% extends "base.html" %}
 {% block content %}
 <div class="page-header">
   <div><h1>Podatki i składki</h1><p class="muted">Rzeczywiście otrzymane przychody, procentowe koszty, podatek, ČSSZ i VZP.</p></div>
-  <div class="button-row"><form class="toolbar year-toolbar" method="get"><input type="number" name="year" min="2020" max="2100" value="{{ snapshot.year }}"><button class="btn btn-light" type="submit">Pokaż rok</button></form><a class="btn btn-light" href="{{ url_for('settings_page', year=snapshot.year) }}">Ustawienia obliczeń</a></div>
+  <div class="button-row"><form class="toolbar year-toolbar" method="get"><input type="number" name="year" min="2020" max="2100" value="{{ snapshot.year }}"><button class="btn btn-light" type="submit">Pokaż rok</button></form><a class="btn btn-light" href="{{ url_for('settings_page', year=snapshot.year) }}">Ustawienia obliczeń</a><a class="btn btn-primary" href="{{ url_for('accountant_export', year=snapshot.year) }}">Pobierz pakiet dla księgowego</a></div>
 </div>
 
 <div class="callout warning"><strong>Wyliczenie orientacyjne.</strong> Kwalifikacja prop firm jest konfigurowalną oceną dokumentów, a nie wiążącą interpretacją urzędu. DPH jest analizowane osobno.</div>
@@ -2337,10 +2339,10 @@ def init_db() -> None:
 
     migrations: list[tuple[str, str, str]] = []
     for column, definition in (
-        ("tax_first_name", "TEXT NOT NULL DEFAULT 'Jakub Karol'"),
-        ("tax_last_name", "TEXT NOT NULL DEFAULT 'Maćkowski'"),
-        ("tax_office_code", "TEXT NOT NULL DEFAULT '451'"),
-        ("tax_branch_code", "TEXT NOT NULL DEFAULT '2002'"),
+        ("tax_first_name", "TEXT NOT NULL DEFAULT ''"),
+        ("tax_last_name", "TEXT NOT NULL DEFAULT ''"),
+        ("tax_office_code", "TEXT NOT NULL DEFAULT ''"),
+        ("tax_branch_code", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in columns("company"):
             migrations.append(("company", column, definition))
@@ -2371,8 +2373,8 @@ def init_db() -> None:
                 default_currency, default_due_days, invoice_prefix, default_language,
                 default_tax_mode, default_reverse_charge_note
             ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, '', '', '', '', '', '', 'EUR', 14, 'FV', 'de', 'reverse_charge', ?)""",
-            ("Jakub Karol Maćkowski", "Uralská 689/7", "160 00", "Praha 6 - Bubeneč",
-             "Česká republika", "19506180", "CZ686656725",
+            ("", "", "", "",
+             "", "", "",
              "Steuerschuldnerschaft des Leistungsempfängers (Reverse Charge). / Daň odvede zákazník."),
         )
     db.commit()
@@ -2432,30 +2434,9 @@ def init_tax_module() -> None:
         "cssz_secondary_min_monthly_base": "TEXT NOT NULL DEFAULT '5387'",
         "vzp_main_from_date": "TEXT NOT NULL DEFAULT ''",
     }
-    added_any = False
     for name, definition in additions.items():
         if name not in tax_columns:
             db.execute(f"ALTER TABLE tax_settings ADD COLUMN {name} {definition}")
-            added_any = True
-
-    # Jednorazowa migracja ustawień użytkownika: lipiec 2026 vedlejší, od sierpnia hlavní.
-    if added_any:
-        row_2026 = db.execute("SELECT * FROM tax_settings WHERE year=2026").fetchone()
-        if row_2026 is not None:
-            current = dict(row_2026)
-            updates = {
-                "income_tax_credit": "30840" if str(current.get("income_tax_credit", "0")).strip() in {"", "0", "0.0", "0.00"} else current.get("income_tax_credit"),
-                "employment_tax_withheld": current.get("employment_tax_withheld", "0") or "0",
-                "cssz_main_from_date": "2026-08-01",
-                "cssz_secondary_min_monthly_base": "5387",
-                "vzp_main_from_date": "2026-08-01",
-            }
-            if current.get("cssz_mode") != "custom":
-                updates.update({"cssz_mode": "mixed", "cssz_min_monthly_base": "17139", "cssz_monthly_advance": "5005"})
-            if current.get("vzp_mode") != "custom":
-                updates.update({"vzp_mode": "mixed", "vzp_min_monthly_base": "24483.50", "vzp_monthly_advance": "3306"})
-            keys = list(updates)
-            db.execute("UPDATE tax_settings SET " + ",".join(f"{key}=?" for key in keys) + " WHERE year=2026", tuple(updates[key] for key in keys))
     db.commit()
 
 
@@ -4246,10 +4227,13 @@ def contribution_parameters_save():
     return redirect(url_for('settings_page', year=year-1, tab='forecast'))
 
 
-def ensure_tax_settings(year: int) -> dict[str, Any]:
+def ensure_tax_settings(year: int, persist: bool = True) -> dict[str, Any]:
     db = get_db()
     row = db.execute("SELECT * FROM tax_settings WHERE year=?", (year,)).fetchone()
     if row is None:
+        savepoint = "accountant_export_tax_settings"
+        if not persist:
+            db.execute(f"SAVEPOINT {savepoint}")
         if year == 2026:
             db.execute("""INSERT INTO tax_settings (
                 year, activity_start_date, revenue_basis, expense_percent, expense_limit,
@@ -4260,9 +4244,9 @@ def ensure_tax_settings(year: int) -> dict[str, Any]:
                 vzp_mode, vzp_main_from_date, vzp_assessment_percent, vzp_rate_percent,
                 vzp_min_monthly_base, vzp_monthly_advance
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-                2026, "2026-07-08", "paid", "60", "1200000", "30840", "0", "0", "1762812",
-                "mixed", "2026-08-01", "117521", "9794", "55", "29.2", "17139", "5387", "5005",
-                "mixed", "2026-08-01", "50", "13.5", "24483.50", "3306"
+                2026, "2026-01-01", "paid", "60", "1200000", "30840", "0", "0", "1762812",
+                "main", "2026-01-01", "117521", "9794", "55", "29.2", "17139", "5387", "5005",
+                "main", "2026-01-01", "50", "13.5", "24483.50", "3306"
             ))
         elif year == 2027:
             db.execute("""INSERT INTO tax_settings (
@@ -4284,8 +4268,12 @@ def ensure_tax_settings(year: int) -> dict[str, Any]:
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (
                 year, start, "30840", "main", start, "17139", "5387", "5005", "main", start, "3306"
             ))
-        db.commit()
+        if persist:
+            db.commit()
         row = db.execute("SELECT * FROM tax_settings WHERE year=?", (year,)).fetchone()
+        if not persist:
+            db.execute(f"ROLLBACK TO {savepoint}")
+            db.execute(f"RELEASE {savepoint}")
     return dict(row)
 
 
@@ -4398,8 +4386,8 @@ def tax_invoice_rows(year: int, basis: str) -> tuple[list[dict[str, Any]], list[
 
 
 
-def compute_tax_snapshot(year: int) -> dict[str, Any]:
-    settings = ensure_tax_settings(year)
+def compute_tax_snapshot(year: int, persist_settings: bool = True) -> dict[str, Any]:
+    settings = ensure_tax_settings(year, persist=persist_settings)
     warnings: list[str] = []
     assumptions: list[str] = []
     basis = settings.get("revenue_basis", "paid")
@@ -4572,6 +4560,387 @@ def compute_tax_snapshot(year: int) -> dict[str, Any]:
         "forecast_welding_revenue": forecast_welding_revenue,
         "forecast_prop_revenue": forecast_prop_revenue, "forecast_total": forecast_total,
     }
+
+
+def accountant_csv_bytes(headers: list[str], rows: list[list[Any]]) -> bytes:
+    output = StringIO(newline="")
+    writer = csv.writer(output, delimiter=";", lineterminator="\r\n")
+    writer.writerow(headers)
+    writer.writerows([["" if value is None else value for value in row] for row in rows])
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
+
+
+def accountant_export_rows(year: int, snapshot: dict[str, Any]) -> dict[str, Any]:
+    db = get_db()
+    payout_rows_raw = db.execute(
+        """SELECT p.*, f.name AS firm_name, i.invoice_number
+             FROM prop_payouts p
+             LEFT JOIN prop_firms f ON f.id=p.prop_firm_id
+             LEFT JOIN invoices i ON i.id=p.linked_invoice_id
+             WHERE substr(p.received_date,1,4)=?
+             ORDER BY p.received_date,p.id""",
+        (str(year),),
+    ).fetchall()
+    included_payout_ids = {int(row["id"]) for row in snapshot["prop_rows_included"]}
+    payout_csv: list[list[Any]] = []
+    payout_groups: dict[str, dict[str, Any]] = {}
+    payout_export_rows: list[dict[str, Any]] = []
+    export_warnings: list[str] = []
+    for raw in payout_rows_raw:
+        item = dict(raw)
+        item["computed_income_czk"] = ""
+        item["computed_fee_czk"] = ""
+        item["computed_net_czk"] = ""
+        item["calculation_status"] = "Nie przeliczono: sprawdź kwoty lub kurs."
+        try:
+            native = {}
+            for field, label in (("gross_amount", "kwota brutto"),
+                                 ("operator_fee", "opłata operatora"),
+                                 ("net_amount", "kwota netto")):
+                if not str(item.get(field) or "").strip():
+                    raise ValueError(f"brak pola: {label}")
+                native[field] = parse_decimal(item[field], label)
+                if not native[field].is_finite() or native[field] < 0:
+                    raise ValueError(f"nieprawidłowa wartość: {label}")
+            currency = str(item.get("currency") or "")
+            group = payout_groups.setdefault(currency, {
+                "count": 0, "gross": Decimal("0"), "fee": Decimal("0"), "net": Decimal("0"),
+            })
+            group["count"] += 1
+            group["gross"] += native["gross_amount"]
+            group["fee"] += native["operator_fee"]
+            group["net"] += native["net_amount"]
+            if not str(item.get("czk_rate") or "").strip():
+                raise ValueError("brak kursu do CZK")
+            rate = parse_decimal(item["czk_rate"], "kurs do CZK")
+            if not rate.is_finite() or rate <= 0:
+                raise ValueError("nieprawidłowy kurs do CZK")
+            amounts = payout_amount_breakdown(native["gross_amount"], native["operator_fee"],
+                                              native["net_amount"], rate)
+            item["computed_income_czk"] = str(amounts["income_czk"])
+            item["computed_fee_czk"] = str(amounts["fee_czk"])
+            item["computed_net_czk"] = str(amounts["net_czk"])
+            item["calculation_status"] = "OK"
+        except (ValueError, InvalidOperation, TypeError) as exc:
+            item["calculation_status"] = f"Błąd danych: {exc}"
+            export_warnings.append(
+                f"Payout {item.get('payout_identifier') or item.get('id')}: {exc}; sprawdź dane źródłowe."
+            )
+        item["included_in_calculation"] = int(item["id"]) in included_payout_ids
+        classification = str(item.get("tax_classification") or "")
+        item["classification_label"] = PROP_TAX_CLASSIFICATIONS.get(classification, classification or "brak")
+        item["qualification_label"] = PROP_QUALIFICATION_STATUSES.get(
+            item.get("qualification_status"), item.get("qualification_status") or "brak")
+        item["dph_label"] = PROP_DPH_TREATMENTS.get(item.get("dph_treatment"), item.get("dph_treatment") or "brak")
+        payout_csv.append([
+            item.get("id"), item.get("payout_identifier"), item.get("firm_name"), item.get("received_date"),
+            item.get("currency"), item.get("gross_amount"), item.get("operator_fee"), item.get("net_amount"),
+            item.get("czk_rate"), item.get("computed_income_czk"), item.get("computed_fee_czk"),
+            item.get("computed_net_czk"), item.get("income_czk"), item.get("classification_label"),
+            item.get("tax_classification"), item.get("qualification_label"), item.get("qualification_status"),
+            item.get("dph_label"), item.get("dph_treatment"), item.get("invoice_number"),
+            "tak" if item["included_in_calculation"] else "nie", item.get("calculation_status"), item.get("notes"),
+        ])
+        payout_export_rows.append(item)
+
+    invoice_rows_in_calculation = {int(row["id"]): row for row in snapshot["invoice_rows"]}
+    invoice_rows_raw = db.execute(
+        """SELECT i.*, c.name AS contractor_name, c.vat_id AS contractor_vat_id,
+                  p.id AS linked_payout_id, p.payout_identifier AS linked_payout_identifier,
+                  p.received_date AS linked_payout_date, p.currency AS linked_payout_currency,
+                  p.gross_amount AS linked_payout_gross, f.name AS linked_prop_firm
+             FROM invoices i
+             LEFT JOIN contractors c ON c.id=i.contractor_id
+             LEFT JOIN prop_payouts p ON p.linked_invoice_id=i.id
+             LEFT JOIN prop_firms f ON f.id=p.prop_firm_id
+             WHERE i.invoice_year=? OR substr(i.issue_date,1,4)=?
+                OR substr(i.supply_date,1,4)=? OR substr(COALESCE(i.paid_date,''),1,4)=?
+                OR EXISTS (SELECT 1 FROM prop_payouts py
+                            WHERE py.linked_invoice_id=i.id AND substr(py.received_date,1,4)=?)
+             ORDER BY i.issue_date,i.id""",
+        (year, str(year), str(year), str(year), str(year)),
+    ).fetchall()
+    invoice_csv: list[list[Any]] = []
+    invoice_item_csv: list[list[Any]] = []
+    invoice_export_count = 0
+    invoice_item_export_count = 0
+    for raw in invoice_rows_raw:
+        invoice = dict(raw)
+        items = [dict(row) for row in db.execute(
+            "SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY position,id", (invoice["id"],)
+        ).fetchall()]
+        totals: dict[str, Any] | None = None
+        try:
+            totals = calculate_items(items, invoice.get("tax_mode", "no_vat"))
+        except (ValueError, InvalidOperation, TypeError, KeyError) as exc:
+            export_warnings.append(f"Faktura {invoice.get('invoice_number')}: nie przeliczono pozycji ({exc}).")
+        included_row = invoice_rows_in_calculation.get(int(invoice["id"]))
+        linked = invoice.get("linked_payout_id") is not None
+        if linked:
+            inclusion_reason = "Powiązana z payoutem; wyłączona z przychodu z faktur, aby uniknąć podwójnego liczenia."
+        elif included_row:
+            inclusion_reason = "Uwzględniona w kalkulatorze według wybranej podstawy."
+        elif snapshot["settings"].get("revenue_basis") == "paid" and invoice.get("status") != "paid":
+            inclusion_reason = "Nieopłacona przy podstawie kasowej; pokazana informacyjnie."
+        else:
+            inclusion_reason = "Nie została uwzględniona w kalkulatorze; sprawdź podstawę i ostrzeżenia."
+        invoice_csv.append([
+            invoice.get("id"), invoice.get("invoice_number"), invoice.get("invoice_year"),
+            invoice.get("contractor_name"), invoice.get("contractor_vat_id"), invoice.get("issue_date"),
+            invoice.get("supply_date"), invoice.get("due_date"), invoice.get("paid_date"), invoice.get("status"),
+            invoice.get("currency"), invoice.get("tax_mode"), invoice.get("dph_category"),
+            str(totals["total_net"]) if totals else "", str(totals["total_vat"]) if totals else "",
+            str(totals["total_gross"]) if totals else "", invoice.get("czk_rate"),
+            included_row.get("recognized_date", "") if included_row else "",
+            str(included_row.get("value_czk", "")) if included_row else "",
+            "tak" if included_row else "nie", invoice.get("linked_payout_id"),
+            invoice.get("linked_payout_identifier"), invoice.get("linked_prop_firm"),
+            invoice.get("linked_payout_date"), inclusion_reason, invoice.get("reverse_charge_note"),
+            invoice.get("notes"),
+        ])
+        invoice_export_count += 1
+        if totals:
+            for item in totals["items"]:
+                invoice_item_csv.append([
+                    invoice.get("invoice_number"), invoice.get("contractor_name"), invoice.get("currency"),
+                    item.get("position"), item.get("description"), item.get("quantity_decimal"),
+                    item.get("unit"), item.get("unit_price_decimal"), item.get("vat_rate_decimal"),
+                    item.get("net"), item.get("vat"), item.get("gross"),
+                ])
+                invoice_item_export_count += 1
+
+    expense_rows_raw = db.execute(
+        "SELECT * FROM expenses WHERE substr(expense_date,1,4)=? ORDER BY expense_date,id", (str(year),)
+    ).fetchall()
+    expense_csv: list[list[Any]] = []
+    for raw in expense_rows_raw:
+        item = dict(raw)
+        value_czk = expense_value_czk(item)
+        expense_csv.append([
+            item.get("expense_date"), item.get("supplier"), item.get("description"),
+            EXPENSE_CATEGORIES.get(item.get("category"), item.get("category")), item.get("document_number"),
+            item.get("amount"), item.get("currency"), item.get("czk_rate"),
+            str(value_czk) if value_czk is not None else "", item.get("business_percent"),
+            item.get("payment_method"), item.get("dph_obligation"), item.get("supplier_vat_id"),
+            item.get("country"), item.get("notes"),
+        ])
+
+    tax_payments = [dict(row) for row in db.execute(
+        "SELECT * FROM tax_payments WHERE substr(payment_date,1,4)=? ORDER BY payment_date,id", (str(year),)
+    ).fetchall()]
+    tax_payment_csv = [[row.get("payment_date"), row.get("payment_type"), row.get("amount"), row.get("note")]
+                       for row in tax_payments]
+    dph_filings = [dict(row) for row in db.execute(
+        "SELECT * FROM dph_filings WHERE period_year=? ORDER BY period_month,filing_kind,id", (year,)
+    ).fetchall()]
+    dph_csv = [[row.get("period_year"), row.get("period_month"), row.get("filing_kind"), row.get("status"),
+                row.get("filed_date"), row.get("confirmation_number"), row.get("notes")]
+               for row in dph_filings]
+    return {
+        "payout_csv": payout_csv,
+        "payout_groups": payout_groups,
+        "payout_export_rows": payout_export_rows,
+        "invoice_csv": invoice_csv,
+        "invoice_item_csv": invoice_item_csv,
+        "invoice_count": invoice_export_count,
+        "invoice_item_count": invoice_item_export_count,
+        "expense_csv": expense_csv,
+        "expense_count": len(expense_csv),
+        "tax_payment_csv": tax_payment_csv,
+        "tax_settings_csv": [[key, value] for key, value in snapshot["settings"].items()],
+        "dph_csv": dph_csv,
+        "export_warnings": export_warnings,
+    }
+
+
+def build_accountant_summary_pdf(year: int, snapshot: dict[str, Any], data: dict[str, Any]) -> BytesIO:
+    font_regular, font_bold, unicode_ok = register_pdf_fonts()
+    buffer = BytesIO()
+    document = SimpleDocTemplate(
+        buffer, pagesize=A4, rightMargin=15 * mm, leftMargin=15 * mm,
+        topMargin=14 * mm, bottomMargin=15 * mm,
+        title=f"Podsumowanie dla księgowego {year}",
+    )
+    styles = getSampleStyleSheet()
+    base = ParagraphStyle("AccountantBase", parent=styles["Normal"], fontName=font_regular,
+                          fontSize=8.5, leading=11, textColor=colors.HexColor("#20252B"))
+    title = ParagraphStyle("AccountantTitle", parent=base, fontName=font_bold,
+                           fontSize=19, leading=23, textColor=colors.HexColor("#7A1735"), spaceAfter=3 * mm)
+    heading = ParagraphStyle("AccountantHeading", parent=base, fontName=font_bold,
+                             fontSize=11, leading=14, textColor=colors.HexColor("#7A1735"),
+                             spaceBefore=4 * mm, spaceAfter=2 * mm)
+    small = ParagraphStyle("AccountantSmall", parent=base, fontSize=7.5, leading=9.5)
+    strong = ParagraphStyle("AccountantStrong", parent=base, fontName=font_bold)
+
+    def p(value: Any, style: ParagraphStyle = base) -> Paragraph:
+        return Paragraph(paragraph_text(value, unicode_ok), style)
+
+    def czk(value: Any) -> str:
+        return f"{format_decimal(value)} CZK"
+
+    story: list[Any] = [
+        p(f"Roczne zestawienie dla księgowego · {year}", title),
+        p(f"Wygenerowano: {date.today().isoformat()} · Firma: {get_company().get('name') or '—'}", small),
+        Spacer(1, 3 * mm),
+        p("To zestawienie pomocnicze z danych zapisanych w aplikacji. Nie jest zeznaniem podatkowym, "
+          "urzędowym wyliczeniem ani wiążącą kwalifikacją payoutów. Księgowy powinien zweryfikować "
+          "dokumenty źródłowe, kursy, klasyfikację PIT i obowiązki DPH.", strong),
+        p(f"Podstawa przychodu w ustawieniach aplikacji: {snapshot['settings'].get('revenue_basis', 'paid')}. "
+          f"Paušální koszty: {snapshot['settings'].get('expense_percent', '—')}% dla grupy 60% "
+          f"oraz {snapshot['settings'].get('expense_40_percent', '—')}% dla grupy 40%.", small),
+        p(f"Zatrudnienie wykazane w ustawieniach: podstawa {czk(snapshot['settings'].get('employment_tax_base', '0'))}; "
+          f"zaliczka potrącona przez pracodawcę {czk(snapshot['settings'].get('employment_tax_withheld', '0'))}. "
+          f"Działalność od {snapshot['settings'].get('activity_start_date') or '—'} do "
+          f"{snapshot['settings'].get('activity_end_date') or 'końca roku'}; "
+          f"ČSSZ: {snapshot.get('cssz_main_months', 0)} mies. hlavní / {snapshot.get('cssz_secondary_months', 0)} mies. vedlejší; "
+          f"VZP: {snapshot.get('vzp_main_months', 0)} mies. hlavní / {snapshot.get('vzp_secondary_months', 0)} mies. vedlejší.", small),
+        p("Przychód z payoutów jest liczony od kwoty brutto przed opłatą operatora, zgodnie z obecnym "
+          "kalkulatorem. Powiązana faktura jest pokazana jako dokument, ale pominięta w przychodzie "
+          "z faktur, aby nie dublować payoutu. Faktyczne wydatki z CSV są informacyjne i nie są "
+          "dodawane drugi raz do kosztów procentowych.", small),
+        p("DPH jest wykazane osobno. Status i kwalifikacja payoutów pochodzą z zapisów użytkownika "
+          "i wymagają potwierdzenia przez księgowego.", small),
+        p("Przychody i szacowane należności", heading),
+    ]
+    summary_rows = [
+        [p("Pozycja", strong), p("Kwota", strong)],
+        [p("Przychód z faktur przyjęty do kalkulatora"), p(czk(snapshot["welding_revenue"]))],
+        [p("Payouty sklasyfikowane jako grupa 60%"), p(czk(snapshot["prop_revenue_60"]))],
+        [p("Payouty sklasyfikowane jako grupa 40%"), p(czk(snapshot["prop_revenue_40"]))],
+        [p("Payouty wyłączone z kalkulatora"), p(czk(snapshot["prop_excluded_revenue"]))],
+        [p("Łączny przychód przyjęty do kalkulatora", strong), p(czk(snapshot["revenue"]), strong)],
+        [p("Szacowane paušální koszty"), p(czk(snapshot["flat_expenses"]))],
+        [p("Szacowany zysk / podstawa z działalności"), p(czk(snapshot["profit"]))],
+        [p("Podatek roczny po uldze"), p(czk(snapshot["annual_tax_after_credit"]))],
+        [p("Szacowane ČSSZ"), p(czk(snapshot["cssz"]))],
+        [p("Szacowane VZP"), p(czk(snapshot["vzp"]))],
+        [p("Podatek potrącony przez pracodawcę"), p(czk(snapshot["employment_tax_withheld"]))],
+        [p("Wpłaty zapisane w aplikacji"), p(czk(sum(snapshot["paid"].values(), Decimal("0"))))],
+        [p("Wpłaty i potrącenia razem"), p(czk(snapshot["total_paid"]))],
+        [p("Pozostało według kalkulatora", strong), p(czk(snapshot["remaining_total"]), strong)],
+    ]
+    table = Table(summary_rows, colWidths=[122 * mm, 58 * mm], repeatRows=1, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F4EAF0")),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D8DCE0")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2.2 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2.2 * mm),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.4 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.4 * mm),
+    ]))
+    story.append(table)
+    story.append(p("Payouty według waluty (kwot nie sumuje się między walutami)", heading))
+    payout_rows = [[p("Waluta", strong), p("Liczba", strong), p("Brutto", strong),
+                    p("Opłaty", strong), p("Netto", strong)]]
+    if data["payout_groups"]:
+        for currency, group in sorted(data["payout_groups"].items()):
+            payout_rows.append([
+                p(currency or "—"), p(group["count"]), p(format_decimal(group["gross"])),
+                p(format_decimal(group["fee"])), p(format_decimal(group["net"])),
+            ])
+    else:
+        payout_rows.append([p("Brak payoutów"), p("0"), p("—"), p("—"), p("—")])
+    payout_table = Table(payout_rows, colWidths=[28 * mm, 20 * mm, 44 * mm, 44 * mm, 44 * mm], repeatRows=1)
+    payout_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F4EAF0")),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D8DCE0")),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1.6 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 1.6 * mm),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.2 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.2 * mm),
+    ]))
+    story.extend([p("Dokumenty w paczce", heading), payout_table,
+                  Spacer(1, 2 * mm),
+                  p(f"Faktury: {data['invoice_count']} · pozycje faktur: {data['invoice_item_count']} · "
+                    f"payouty: {len(data['payout_export_rows'])} · wydatki: {data['expense_count']} · "
+                    f"wpłaty: {len(data['tax_payment_csv'])} · zgłoszenia DPH: {len(data['dph_csv'])}.", small),
+                  p("Opłaty operatora i kwoty netto są wyeksportowane oddzielnie. Nie przesądzają o "
+                    "podatkowej odliczalności opłaty. Przeliczenia do CZK pokazują zapisany kurs i "
+                    "bieżący wzór kalkulatora.", small)])
+    notices = list(snapshot.get("assumptions", [])) + list(snapshot.get("warnings", [])) + data["export_warnings"]
+    if notices:
+        story.append(p("Założenia i ostrzeżenia do sprawdzenia", heading))
+        for notice in notices:
+            story.append(p("• " + str(notice), small))
+            story.append(Spacer(1, 1 * mm))
+    document.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+@app.route("/accountant-export.zip")
+def accountant_export():
+    try:
+        year = int(request.args.get("year", date.today().year))
+        if year < 2020 or year > 2100:
+            raise ValueError
+    except (TypeError, ValueError):
+        abort(400, description="Wybierz prawidłowy rok od 2020 do 2100.")
+
+    snapshot = compute_tax_snapshot(year, persist_settings=False)
+    data = accountant_export_rows(year, snapshot)
+    contents = {
+        f"faktury_{year}.csv": accountant_csv_bytes(
+            ["ID", "Numer faktury", "Rok numeracji", "Kontrahent", "VAT ID kontrahenta", "Data wystawienia",
+             "Data usługi", "Termin płatności", "Data zapłaty", "Status", "Waluta", "Tryb podatkowy",
+             "Kategoria DPH", "Netto", "DPH/VAT", "Brutto", "Zapisany kurs do CZK", "Data przychodu wg kalkulatora",
+             "Wartość przychodu CZK", "Uwzględniona w kalkulatorze", "ID powiązanego payoutu",
+             "Identyfikator payoutu", "Prop firma", "Data payoutu", "Powód / uwagi", "Adnotacja odwrotnego obciążenia",
+             "Uwagi faktury"], data["invoice_csv"]),
+        f"pozycje_faktur_{year}.csv": accountant_csv_bytes(
+            ["Numer faktury", "Kontrahent", "Waluta", "Pozycja", "Opis", "Ilość", "Jednostka",
+             "Cena jednostkowa", "Stawka VAT", "Netto", "VAT", "Brutto"], data["invoice_item_csv"]),
+        f"payouty_prop_firm_{year}.csv": accountant_csv_bytes(
+            ["ID", "Identyfikator payoutu", "Prop firma", "Data otrzymania", "Waluta", "Brutto",
+             "Opłata operatora", "Netto", "Kurs do CZK", "Brutto CZK wg wzoru", "Opłata CZK wg wzoru",
+             "Netto CZK wg wzoru", "Zapisany przychód CZK", "Klasyfikacja PIT", "Kod PIT",
+             "Status kwalifikacji", "Kod statusu", "Klasyfikacja DPH", "Kod DPH", "Powiązana faktura",
+             "Uwzględniony w kalkulatorze", "Status przeliczenia", "Uwagi"],
+            data["payout_csv"]),
+        f"wydatki_{year}.csv": accountant_csv_bytes(
+            ["Data", "Dostawca", "Opis", "Kategoria", "Numer dokumentu", "Kwota", "Waluta", "Kurs do CZK",
+             "Wartość CZK wg aplikacji", "Część firmowa %", "Metoda płatności", "DPH", "VAT ID dostawcy",
+             "Kraj", "Uwagi"], data["expense_csv"]),
+        f"zaliczki_i_wplaty_{year}.csv": accountant_csv_bytes(
+            ["Data wpłaty", "Rodzaj", "Kwota CZK", "Uwagi"], data["tax_payment_csv"]),
+        f"ustawienia_kalkulatora_{year}.csv": accountant_csv_bytes(
+            ["Parametr ustawienia", "Zapisana wartość"], data["tax_settings_csv"]),
+        f"zgloszenia_DPH_{year}.csv": accountant_csv_bytes(
+            ["Rok", "Miesiąc", "Rodzaj", "Status", "Data złożenia", "Numer potwierdzenia", "Uwagi"],
+            data["dph_csv"]),
+    }
+    contents[f"podsumowanie_roczne_{year}.pdf"] = build_accountant_summary_pdf(year, snapshot, data).getvalue()
+    readme = (
+        f"PAKIET DLA KSIĘGOWEGO — {year}\n\n"
+        "Zestawienie pomocnicze wygenerowane z zapisów aplikacji Faktury OSVČ. PDF zawiera bieżący "
+        "wynik kalkulatora wraz z ostrzeżeniami i założeniami. CSV zawierają dane źródłowe aplikacji.\n\n"
+        "WAŻNE ZASADY ODCZYTU\n"
+        "- Kalkulator nie jest zeznaniem podatkowym ani wiążącą interpretacją. Zweryfikuj dokumenty, "
+        "kwalifikację PIT, kursy walut i obowiązki DPH.\n"
+        "- Przychód z payoutu kalkulator liczy od kwoty brutto przed opłatą operatora. Powiązana faktura "
+        "jest dołączona jako dokument, ale nie jest liczona drugi raz jako przychód z faktury.\n"
+        "- Klasyfikacja payoutu i status DPH są zapisami do weryfikacji. Opłata operatora nie jest tu "
+        "automatycznie uznana za koszt podatkowy.\n"
+        "- Faktyczne wydatki są wyeksportowane informacyjnie; przy kosztach procentowych aplikacja nie "
+        "dodaje ich drugi raz do kalkulacji.\n"
+        "- Ustawienia kalkulatora, w tym podstawa i potrącenia z zatrudnienia, są w osobnym CSV.\n"
+        "- Nie sumuj kwot z różnych walut. W payoutach pozostawiono kwotę brutto, opłatę, netto i kurs "
+        "osobno; błędne lub brakujące dane są oznaczone w CSV.\n"
+        "- Pliki CSV używają UTF-8 z BOM i separatora średnikowego.\n"
+    ).encode("utf-8-sig")
+    contents[f"czytaj_przed_ksiegowym_{year}.txt"] = readme
+
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        for filename, content in contents.items():
+            package.writestr(filename, content)
+    archive.seek(0)
+    return send_file(archive, mimetype="application/zip", as_attachment=True,
+                     download_name=f"Pakiet_dla_ksiegowego_{year}.zip")
 
 
 
@@ -4776,13 +5145,54 @@ def invoice_new() -> str:
     contractors = [dict(row) for row in db.execute("SELECT * FROM contractors ORDER BY name COLLATE NOCASE").fetchall()]
     projects = [dict(row) for row in db.execute("SELECT * FROM projects WHERE active=1 ORDER BY project_number COLLATE NOCASE").fetchall()]
     if request.method == "GET":
-        invoice, items = default_new_invoice(company, request.args.get("contractor_id", ""))
-        return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors, projects=projects, company=company, is_edit=False)
-    invoice, items = invoice_form_from_request(); errors = validate_invoice(invoice, items)
+        work_entry_ids = []
+        transfer_to_timesheet = False
+        try:
+            work_entry_ids = parse_work_entry_ids(request.args.get("work_ids", ""))
+            selected_entries = work_entries_for_invoice(work_entry_ids) if work_entry_ids else []
+            if selected_entries:
+                invoice, items = invoice_from_work_entries(company, selected_entries)
+            else:
+                invoice, items = default_new_invoice(company, request.args.get("contractor_id", ""))
+        except ValueError as exc:
+            flash(str(exc), "error")
+            work_entry_ids = []
+            invoice, items = default_new_invoice(company, request.args.get("contractor_id", ""))
+        return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors,
+                               projects=projects, company=company, is_edit=False,
+                               selected_work_entry_ids=work_entry_ids, transfer_to_timesheet=transfer_to_timesheet)
+    transfer_to_timesheet = request.form.get("create_timesheet_from_work_entries") == "1"
+    invoice, items = invoice_form_from_request()
+    errors = validate_invoice(invoice, items)
+    try:
+        work_entry_ids = parse_work_entry_ids(request.form.get("work_entry_ids", ""))
+        if work_entry_ids:
+            selected_work_entries = work_entries_for_invoice(
+                work_entry_ids, contractor_id=invoice["contractor_id"], currency=invoice["currency"]
+            )
+        else:
+            selected_work_entries = []
+    except ValueError as exc:
+        work_entry_ids = []
+        errors.append(str(exc))
+    transfer_to_timesheet = transfer_to_timesheet and bool(work_entry_ids)
+    if work_entry_ids and not errors:
+        if len(items) != 1:
+            errors.append("Godziny z ewidencji tworzą jedną zbiorczą pozycję na fakturze.")
+        else:
+            expected_amount = work_entries_invoice_amount(selected_work_entries)
+            entered_quantity = parse_decimal(items[0].get("quantity", "0"), "ilość")
+            entered_amount = parse_decimal(items[0].get("unit_price", "0"), "kwota pozycji")
+            if entered_quantity != Decimal("1") or entered_amount != expected_amount:
+                errors.append("Jedna pozycja musi mieć ilość 1 i kwotę równą sumie godzin pomnożonych przez stawki z ewidencji.")
+            elif expected_amount <= 0:
+                errors.append("Uzupełnij dodatnie stawki w ewidencji godzin przed przygotowaniem faktury.")
     if not errors: errors.extend(prepare_invoice_fx(invoice))
     if errors:
         for error in errors: flash(error, "error")
-        return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors, projects=projects, company=company, is_edit=False)
+        return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors,
+                               projects=projects, company=company, is_edit=False,
+                               selected_work_entry_ids=work_entry_ids, transfer_to_timesheet=transfer_to_timesheet)
     try:
         number, year, sequence = next_invoice_identity(db, invoice["issue_date"], company["invoice_prefix"])
         variable = invoice["variable_symbol"] or f"{year}{sequence:03d}"
@@ -4799,19 +5209,38 @@ def invoice_new() -> str:
             vat = "0" if invoice["tax_mode"] != "vat" else str(parse_decimal(item["vat_rate"]))
             db.execute("INSERT INTO invoice_items (invoice_id, position, description, quantity, unit, unit_price, vat_rate) VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (invoice_id, pos, item["description"].strip(), str(parse_decimal(item["quantity"])), item["unit"].strip(), str(parse_decimal(item["unit_price"])), vat))
+        if work_entry_ids:
+            marks = ",".join("?" for _ in work_entry_ids)
+            updated = db.execute(
+                f"UPDATE daily_work_entries SET invoice_id=?,updated_at=CURRENT_TIMESTAMP "
+                f"WHERE invoice_id IS NULL AND id IN ({marks})",
+                (invoice_id, *work_entry_ids),
+            )
+            if updated.rowcount != len(work_entry_ids):
+                raise ValueError("Niektóre wpisy godzin zostały już przypisane do innej faktury. Odśwież listę godzin.")
         save_fx_quote("invoice", invoice_id, "document", invoice.get("_fx_quote"))
         db.commit()
+    except ValueError as exc:
+        db.rollback()
+        flash(str(exc), "error")
+        return render_template("invoice_form.html", invoice=invoice, items=items, contractors=contractors,
+                               projects=projects, company=company, is_edit=False,
+                               selected_work_entry_ids=work_entry_ids, transfer_to_timesheet=transfer_to_timesheet)
     except Exception:
         db.rollback(); raise
     try:
-        path = save_invoice_pdf_to_disk(invoice_id); flash(f"Faktura {number} została wystawiona i zapisana w: {path.parent}", "success")
+        path = save_invoice_pdf_to_disk(invoice_id)
+        message = f"Faktura {number} została wystawiona i zapisana w: {path.parent}"
+        if work_entry_ids: message += f" Powiązano {len(work_entry_ids)} dziennych wpisów godzin."
+        flash(message, "success")
     except Exception as exc:
         flash(f"Faktura {number} została wystawiona, ale zapis PDF nie powiódł się: {exc}", "error")
     created, _, totals = get_invoice_bundle(invoice_id); info = invoice_dph_info(created, totals)
     if info["kind"] == "eu_service": flash(f"DPH: faktura trafi do SH VIES za {info['period_label']}. Termin {date_pl_filter(info['due_date'])}.", "success")
     elif info["warning"]: flash(f"DPH: {info['warning']}", "error")
+    if transfer_to_timesheet:
+        return redirect(url_for("timesheet_edit", invoice_id=invoice_id, import_work_entries=1))
     return redirect(url_for("invoice_view", invoice_id=invoice_id))
-
 
 @app.route("/invoices/<int:invoice_id>")
 def invoice_view(invoice_id: int) -> str:
@@ -4820,10 +5249,13 @@ def invoice_view(invoice_id: int) -> str:
         """SELECT p.*, f.name AS firm_name FROM prop_payouts p JOIN prop_firms f ON f.id=p.prop_firm_id WHERE p.linked_invoice_id=?""",
         (invoice_id,),
     ).fetchone()
+    work_entries = [dict(row) for row in get_db().execute(
+        "SELECT * FROM daily_work_entries WHERE invoice_id=? ORDER BY work_date,id", (invoice_id,)
+    ).fetchall()]
     return render_template("invoice_detail.html", invoice=invoice, items=totals["items"], totals=totals,
                            company=get_company(), dph_info=invoice_dph_info(invoice, totals),
-                           linked_payout=dict(linked) if linked else None, today=date.today().isoformat())
-
+                           linked_payout=dict(linked) if linked else None, today=date.today().isoformat(),
+                           work_entries=work_entries)
 
 
 @app.route("/invoices/<int:invoice_id>/edit", methods=["GET", "POST"])
@@ -5534,6 +5966,7 @@ def import_database():
         if current is not None:
             current.close()
         os.replace(temp_path, DB_PATH)
+        daily_hours_backup_before_migration()
         ts_backup_before_migration()
         v83_backup_before_migration()
         v82_backup_before_migration()
@@ -5543,6 +5976,7 @@ def import_database():
         init_v82_module()
         init_v83_module()
         init_timesheets_module()
+        init_daily_hours_module()
         contractor_count = get_db().execute("SELECT COUNT(*) AS c FROM contractors").fetchone()["c"]
         backup_note = f" Poprzednia baza: {backup_path.name}." if backup_path else ""
         flash(f"Baza została zaimportowana. Wczytano {contractor_count} kontrahentów.{backup_note}", "success")
@@ -6094,6 +6528,16 @@ def ts_invoice_fingerprint(invoice: dict[str,Any], items: list[dict[str,Any]]) -
 
 
 def ts_hours_warning(invoice: dict[str,Any], items: list[dict[str,Any]], minutes: int) -> str:
+    invoice_id = invoice.get('id')
+    if invoice_id:
+        linked = get_db().execute(
+            'SELECT SUM(minutes) AS total_minutes FROM daily_work_entries WHERE invoice_id=?', (invoice_id,)
+        ).fetchone()
+        if linked and linked['total_minutes'] is not None:
+            expected_minutes = int(linked['total_minutes'])
+            if expected_minutes != minutes:
+                return f'Różnica: ewidencja dzienna ma {ts_hours(expected_minutes)}, lista {ts_hours(minutes)}. Sprawdź wpisy przed podpisem.'
+            return ''
     units = {'h','hr','hrs','hour','hours','hod','hod.','hodina','hodiny','godz','godz.','std','std.','stunde','stunden'}
     hours = [parse_decimal(str(r['quantity'])) for r in items if str(r.get('unit','')).lower().strip() in units]
     if not hours:
@@ -6395,11 +6839,41 @@ def ts_cached_file(invoice:dict,version:dict) -> None:
     temp=dest.with_suffix('.tmp');temp.write_bytes(version['pdf_blob']);os.replace(temp,dest)
 
 
+def ts_rows_from_daily_work_entries(invoice_id: int, settings: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    db = get_db()
+    daily = db.execute('''SELECT work_date,SUM(minutes) AS minutes FROM daily_work_entries
+                          WHERE invoice_id=? GROUP BY work_date ORDER BY work_date''', (invoice_id,)).fetchall()
+    projects = [str(row['project_number']).strip() for row in db.execute(
+        "SELECT DISTINCT project_number FROM daily_work_entries WHERE invoice_id=? AND TRIM(project_number)!='' ORDER BY project_number",
+        (invoice_id,),
+    ).fetchall()]
+    if not daily:
+        return [], projects
+    start_minutes = ts_minutes(settings.get('default_start', '06:30'))
+    default_break = int(settings.get('default_break', 0))
+    rows = []
+    for entry in daily:
+        net_minutes = int(entry['minutes'])
+        pause = min(default_break, max(0, 1440 - net_minutes))
+        end_absolute = start_minutes + net_minutes + pause
+        rows.append({
+            'date': entry['work_date'],
+            'start': f'{start_minutes // 60:02d}:{start_minutes % 60:02d}',
+            'end': f'{(end_absolute % 1440) // 60:02d}:{(end_absolute % 1440) % 60:02d}',
+            'break_minutes': pause,
+            'next_day': end_absolute >= 1440,
+            'minutes': net_minutes,
+        })
+    return rows, projects
+
+
 @app.route('/invoices/<int:invoice_id>/timesheet',methods=['GET','POST'])
 def timesheet_edit(invoice_id:int):
     invoice,items,totals=get_invoice_bundle(invoice_id)
     sheet=get_db().execute('SELECT * FROM timesheets WHERE invoice_id=?',(invoice_id,)).fetchone()
     current=ts_current(sheet); settings=ts_settings();errors=[]
+    import_requested=request.args.get('import_work_entries')=='1'
+    imported_from_daily=False; imported_projects_mixed=False
     if request.method=='POST':
         ts_verify_csrf()
         try:
@@ -6423,12 +6897,30 @@ def timesheet_edit(invoice_id:int):
     if current:
         form=dict(current['payload']); form['revision']=current['revision']
         form['signature_mode']='keep' if form.get('signature_base64') else 'none'
+        if import_requested:
+            flash('Ta faktura ma już zapisaną listę godzin; nie nadpisano jej wpisów.', 'error')
     else:
         d=date.fromisoformat(invoice['supply_date']);monday=d-timedelta(days=d.weekday())
         form={'company_label':settings['company_label'] if 'equans' in invoice.get('contractor_name','').casefold() else invoice.get('contractor_name',settings['company_label']),'worker_name':settings['worker_name'],
               'period_start':monday.isoformat(),'period_end':(monday+timedelta(days=3)).isoformat(),
               'project_number':invoice.get('order_number',''),'show_project':settings.get('show_project',False),
               'rows':[],'revision':0,'signature_mode':'none'}
+        if import_requested:
+            rows, imported_projects = ts_rows_from_daily_work_entries(invoice_id, settings)
+            if rows:
+                form['rows'] = rows
+                form['period_start'] = rows[0]['date']
+                form['period_end'] = rows[-1]['date']
+                imported_projects_mixed = len(imported_projects) > 1
+                if len(imported_projects) == 1:
+                    form['project_number'] = imported_projects[0]
+                elif imported_projects:
+                    label = ', '.join(imported_projects)
+                    form['project_number'] = label if len(label) <= 80 else ''
+                imported_from_daily = True
+                flash('Przeniesiono daty i łączny czas jako szkic listy. Sprawdź rzeczywiste początki, końce i przerwy przed zapisem.', 'success')
+            else:
+                flash('Do tej faktury nie ma powiązanych dziennych wpisów do przeniesienia.', 'error')
         # Duplicating last list does not copy its signature/approvals; next form stays draft.
         if request.args.get('copy')=='previous':
             prior=get_db().execute('''SELECT v.payload_json FROM timesheets s
@@ -6453,7 +6945,8 @@ def timesheet_edit(invoice_id:int):
     warning=ts_hours_warning(invoice,items,current['total_minutes']) if current else ''
     changed=bool(current and current['payload'].get('invoice_fingerprint')!=ts_invoice_fingerprint(invoice,items))
     return render_template('timesheet_form.html',invoice=invoice,form=form,ts_options=settings,
-                           current=current,history=history,errors=errors,hours_warning=warning,invoice_changed=changed)
+                           current=current,history=history,errors=errors,hours_warning=warning,invoice_changed=changed,
+                           imported_from_daily=imported_from_daily,imported_projects_mixed=imported_projects_mixed)
 
 
 @app.route('/invoices/<int:invoice_id>/timesheet/pdf')
@@ -6579,7 +7072,7 @@ EMBEDDED_TEMPLATES['timesheet_form.html'] = r'''{% extends 'base.html' %}
 <div class="page-header"><div><h1>Lista godzin</h1><p class="muted">{{ invoice.invoice_number }} · {{ invoice.contractor_name }} · styl 5, niebieski długopis</p></div><div class="button-row"><a class="btn btn-light" href="{{ url_for('invoice_view',invoice_id=invoice.id) }}">Wróć do faktury</a><a class="btn btn-light" href="{{ url_for('timesheet_settings_page') }}">Ustawienia list</a></div></div>
 {% for error in errors %}<div class="callout warning" role="alert">{{ error }}</div>{% endfor %}
 {% if invoice_changed %}<div class="callout warning">Faktura została zmieniona od zapisu listy. Zapisany PDF pozostaje niezmienny; sprawdź zgodność i zapisz nową wersję.</div>{% endif %}
-{% if hours_warning %}<div class="callout warning">{{ hours_warning }}</div>{% endif %}
+{% if hours_warning %}<div class="callout warning">{{ hours_warning }}</div>{% endif %}{% if imported_from_daily %}<div class="callout warning">Wpisane godziny nie zawierają godzin rozpoczęcia, zakończenia ani przerw. Formularz wypełniono wartościami domyślnymi; popraw je według rzeczywistych danych przed zapisaniem lub podpisaniem listy.{% if imported_projects_mixed %} Wpisy obejmują kilka projektów, dlatego pole projektu wymaga sprawdzenia.{% endif %}</div>{% endif %}
 {% if current %}<section class="panel ts-saved"><div><strong>Zapisana wersja {{ current.revision }} · {{ ts_hours(current.total_minutes) }}</strong><p class="muted">{{ current.created_at }}. Ten PDF zawiera wpisy i podpis z chwili zapisu.</p></div><div class="button-row"><a class="btn btn-primary" href="{{ url_for('timesheet_pdf',invoice_id=invoice.id) }}">Pobierz listę PDF</a><a class="btn btn-light" href="{{ url_for('invoice_timesheet_bundle',invoice_id=invoice.id) }}">Faktura + lista (ZIP)</a></div></section>{% endif %}
 <form method="post" class="panel form-panel" id="ts-form" data-defaults='{{ ts_options|tojson }}'>
 <input type="hidden" name="_ts_csrf" value="{{ ts_csrf_token() }}"><input type="hidden" name="revision" value="{{ form.revision }}">
@@ -6692,8 +7185,458 @@ document.getElementById('ts-signature-mode').addEventListener('change',signMode)
 });
 '''
 
+# V8.10: dzienna ewidencja czasu, niezależna od faktury, z opcjonalnym przypięciem przy jej wystawieniu.
+DAILY_HOURS_MAX_SELECTED = 200
+
+def daily_hours_backup_before_migration() -> None:
+    if not DB_PATH.exists() or not DB_PATH.stat().st_size:
+        return
+    with sqlite3.connect(DB_PATH) as source:
+        table = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_work_entries'").fetchone()
+        has_work_type = table and 'work_type' in {row[1] for row in source.execute('PRAGMA table_info(daily_work_entries)')}
+        has_rate_defaults = source.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_rate_defaults'"
+        ).fetchone()
+        if table and has_work_type and has_rate_defaults:
+            return
+        name = 'przed_aktualizacja_V8_10_stawki_domyslne_i_lista_godzin_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.sqlite3'
+        backup = BACKUP_DIR / name
+        with sqlite3.connect(backup) as destination:
+            source.backup(destination)
+            if destination.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise RuntimeError('Kopia przed migracją ewidencji nie przeszła kontroli. Baza nie została zmieniona.')
+    if REMOTE_DB_ENABLED and not upload_file_to_supabase(backup, 'backups/' + name):
+        raise RuntimeError('Nie udało się zapisać kopii przed migracją ewidencji w Supabase. Baza nie została zmieniona.')
+
+def init_daily_hours_module() -> None:
+    db = get_db()
+    db.executescript('''
+    CREATE TABLE IF NOT EXISTS daily_work_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_date TEXT NOT NULL,
+        contractor_id INTEGER NOT NULL,
+        work_type TEXT NOT NULL DEFAULT 'Inne',
+        project_number TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL,
+        minutes INTEGER NOT NULL CHECK(minutes > 0 AND minutes <= 1440 AND minutes % 15 = 0),
+        hourly_rate TEXT NOT NULL DEFAULT '0',
+        currency TEXT NOT NULL DEFAULT 'CZK',
+        notes TEXT NOT NULL DEFAULT '',
+        invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (contractor_id) REFERENCES contractors(id) ON DELETE RESTRICT
+    );
+    CREATE INDEX IF NOT EXISTS idx_daily_work_entries_date ON daily_work_entries(work_date);
+    CREATE INDEX IF NOT EXISTS idx_daily_work_entries_contractor ON daily_work_entries(contractor_id,work_date);
+    CREATE INDEX IF NOT EXISTS idx_daily_work_entries_invoice ON daily_work_entries(invoice_id);
+    CREATE TABLE IF NOT EXISTS work_rate_defaults (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_number TEXT NOT NULL DEFAULT '',
+        work_type TEXT NOT NULL,
+        hourly_rate TEXT NOT NULL,
+        currency TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(project_number,work_type,currency)
+    );
+    ''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(daily_work_entries)').fetchall()}
+    if 'work_type' not in columns:
+        db.execute("ALTER TABLE daily_work_entries ADD COLUMN work_type TEXT NOT NULL DEFAULT 'Inne'")
+    db.commit()
+
+def get_work_rate_defaults() -> list[dict[str, Any]]:
+    return [dict(row) for row in get_db().execute(
+        'SELECT * FROM work_rate_defaults ORDER BY project_number COLLATE NOCASE,work_type,currency'
+    ).fetchall()]
+
+def find_work_rate_default(project_number: str, work_type: str, currency: str) -> dict[str, Any] | None:
+    rows = get_work_rate_defaults()
+    project_number = project_number.strip()
+    currency = currency.strip().upper()
+    for row in rows:
+        if row['project_number'] == project_number and row['work_type'] == work_type and row['currency'] == currency:
+            return row
+    for row in rows:
+        if row['project_number'] == project_number and row['work_type'] == work_type:
+            return row
+    for row in rows:
+        if not row['project_number'] and row['work_type'] == work_type and row['currency'] == currency:
+            return row
+    for row in rows:
+        if not row['project_number'] and row['work_type'] == work_type:
+            return row
+    return None
+
+def parse_work_entry_ids(raw: Any) -> list[int]:
+    values = [str(value).strip() for value in raw] if isinstance(raw, (list, tuple)) else [part.strip() for part in str(raw or '').split(',') if part.strip()]
+    if not values: return []
+    if len(values) > DAILY_HOURS_MAX_SELECTED:
+        raise ValueError(f'Jedna faktura może pobrać maksymalnie {DAILY_HOURS_MAX_SELECTED} wpisów godzin.')
+    try: ids = [int(value) for value in values]
+    except (TypeError, ValueError): raise ValueError('Nieprawidłowa lista wybranych wpisów godzin.') from None
+    if any(value <= 0 for value in ids) or len(set(ids)) != len(ids):
+        raise ValueError('Wybierz poprawne, niepowtarzające się wpisy godzin.')
+    return ids
+
+def work_entries_for_invoice(ids: list[int], contractor_id: Any = None, currency: Any = None) -> list[dict[str, Any]]:
+    if not ids: return []
+    marks = ','.join('?' for _ in ids)
+    rows = get_db().execute(f'''SELECT w.*,c.name AS contractor_name FROM daily_work_entries w
+        JOIN contractors c ON c.id=w.contractor_id WHERE w.id IN ({marks}) ORDER BY w.work_date,w.id''', ids).fetchall()
+    if len(rows) != len(ids): raise ValueError('Nie znaleziono wszystkich wybranych wpisów. Odśwież listę godzin.')
+    entries = [dict(row) for row in rows]
+    if any(row['invoice_id'] is not None for row in entries):
+        raise ValueError('Co najmniej jeden wpis jest już przypisany do faktury. Odśwież listę godzin.')
+    contractors = {int(row['contractor_id']) for row in entries}
+    currencies = {str(row['currency']).upper() for row in entries}
+    if len(contractors) != 1: raise ValueError('Do jednej faktury wybierz godziny tylko dla jednego kontrahenta.')
+    if len(currencies) != 1: raise ValueError('Do jednej faktury wybierz godziny tylko w jednej walucie.')
+    if contractor_id not in (None, '') and next(iter(contractors)) != int(contractor_id):
+        raise ValueError('Kontrahent faktury musi odpowiadać wybranym wpisom godzin.')
+    if currency not in (None, '') and next(iter(currencies)) != str(currency).strip().upper():
+        raise ValueError('Waluta faktury musi odpowiadać wybranym wpisom godzin.')
+    return entries
+
+def work_hours_quantity(minutes: int) -> str:
+    return format((Decimal(int(minutes)) / Decimal(60)).normalize(), 'f')
+
+def work_entries_invoice_amount(entries: list[dict[str, Any]]) -> Decimal:
+    amount = sum((Decimal(int(row['minutes'])) / Decimal(60) * parse_decimal(row['hourly_rate'] or '0', 'stawka godzinowa') for row in entries), Decimal('0'))
+    return q2(amount)
+
+def invoice_from_work_entries(company: dict[str, Any], entries: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    invoice, _ = default_new_invoice(company, str(entries[0]['contractor_id']))
+    invoice['currency'] = str(entries[0]['currency']).upper()
+    invoice['czk_rate'] = '1' if invoice['currency'] == 'CZK' else ''
+    invoice['supply_date'] = max(row['work_date'] for row in entries)
+    projects = {str(row['project_number']).strip() for row in entries if str(row['project_number']).strip()}
+    invoice['order_number'] = next(iter(projects)) if len(projects) == 1 else ''
+    amount = work_entries_invoice_amount(entries)
+    items = [{'description': 'Prace zgodnie z ustaleniami', 'quantity': '1',
+              'unit': 'usługa', 'unit_price': format(amount, 'f'), 'vat_rate': '0'}]
+    return invoice, items
+
+def worklog_form_values(entry: dict[str, Any] | None = None) -> dict[str, Any]:
+    company = get_company()
+    if entry:
+        return {**entry, 'hours': work_hours_quantity(entry['minutes']),
+                'work_type': entry.get('work_type') or 'Inne',
+                'hourly_rate': str(entry['hourly_rate'] or '0'),
+                'currency': str(entry['currency'] or company['default_currency']).upper()}
+    work_type = request.args.get('work_type', 'Spawanie')
+    if work_type not in {'Spawanie', 'Monterka', 'Inne'}: work_type = 'Spawanie'
+    project_number = request.args.get('project_number', '').strip()
+    rate_default = find_work_rate_default(project_number, work_type, company['default_currency'])
+    return {'id': None, 'work_date': date.today().isoformat(), 'contractor_id': request.args.get('contractor_id', ''),
+            'work_type': work_type, 'project_number': project_number, 'description': 'Prace', 'hours': '8',
+            'hourly_rate': rate_default['hourly_rate'] if rate_default else '',
+            'currency': rate_default['currency'] if rate_default else company['default_currency'],
+            'notes': '', 'invoice_id': None}
+
+def worklog_data_from_form() -> dict[str, Any]:
+    try: work_date = date.fromisoformat(request.form.get('work_date', '').strip()).isoformat()
+    except ValueError: raise ValueError('Wybierz poprawną datę pracy.') from None
+    try: contractor_id = int(request.form.get('contractor_id', '').strip())
+    except (TypeError, ValueError): raise ValueError('Wybierz kontrahenta.') from None
+    if not get_db().execute('SELECT 1 FROM contractors WHERE id=?', (contractor_id,)).fetchone():
+        raise ValueError('Wybrany kontrahent już nie istnieje.')
+    work_type = request.form.get('work_type', '').strip()
+    if work_type not in {'Spawanie', 'Monterka', 'Inne'}:
+        raise ValueError('Wybierz rodzaj pracy: spawanie, monterka albo inne.')
+    description = ts_text(request.form.get('description'), 'Opis pracy', 200)
+    project_number = ts_text(request.form.get('project_number'), 'Numer projektu', 80, required=False)
+    try:
+        hours = parse_decimal(request.form.get('hours', ''), 'liczba godzin')
+        if not hours.is_finite() or hours <= 0 or hours > 24: raise ValueError
+        minutes_value = hours * Decimal(60)
+        if minutes_value != minutes_value.to_integral_value() or int(minutes_value) % 15: raise ValueError
+        minutes = int(minutes_value)
+    except (ValueError, InvalidOperation):
+        raise ValueError('Godziny muszą wynosić od 0,25 do 24 h, z dokładnością do 15 minut.') from None
+    try:
+        rate = parse_decimal(request.form.get('hourly_rate', '') or '0', 'stawka godzinowa')
+        if not rate.is_finite() or rate < 0: raise ValueError
+    except (ValueError, InvalidOperation): raise ValueError('Stawka godzinowa musi być liczbą nieujemną.') from None
+    currency = request.form.get('currency', '').strip().upper()
+    if not re.fullmatch(r'[A-Z0-9]{3,6}', currency): raise ValueError('Podaj poprawny kod waluty, np. CZK, EUR lub USD.')
+    notes = ts_text(request.form.get('notes'), 'Notatka', 500, required=False)
+    return {'work_date': work_date, 'contractor_id': contractor_id, 'work_type': work_type,
+            'project_number': project_number, 'description': description, 'minutes': minutes, 'hourly_rate': format(rate, 'f'),
+            'currency': currency, 'notes': notes}
+
+@app.before_request
+def worklog_require_cloud_auth_configuration():
+    endpoint = str(request.endpoint or '')
+    if CLOUD_MODE and not APP_PASSWORD and endpoint.startswith('worklog_'):
+        abort(503, description='Ustaw APP_PASSWORD przed udostępnieniem dziennej ewidencji godzin w chmurze.')
+
+@app.route('/hours')
+def worklog_list():
+    db = get_db()
+    month = request.args.get('month', date.today().strftime('%Y-%m'))
+    try: first = date.fromisoformat(month + '-01')
+    except ValueError:
+        first = date.today().replace(day=1); month = first.strftime('%Y-%m')
+    next_month = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    last = next_month - timedelta(days=1)
+    status = request.args.get('status', 'open')
+    if status not in {'open', 'invoiced', 'all'}: status = 'open'
+    contractor_id = request.args.get('contractor_id', '').strip()
+    invoice_id = request.args.get('invoice_id', '').strip()
+    conditions = []; params: list[Any] = []
+    if invoice_id:
+        try: invoice_id_int = int(invoice_id)
+        except ValueError: abort(404)
+        conditions.append('w.invoice_id=?'); params.append(invoice_id_int); status = 'all'
+    else:
+        conditions.append('w.work_date BETWEEN ? AND ?'); params.extend((first.isoformat(), last.isoformat()))
+        if status == 'open': conditions.append('w.invoice_id IS NULL')
+        elif status == 'invoiced': conditions.append('w.invoice_id IS NOT NULL')
+    if contractor_id:
+        try: contractor_id_int = int(contractor_id)
+        except ValueError: contractor_id_int = 0
+        conditions.append('w.contractor_id=?'); params.append(contractor_id_int)
+    query = '''SELECT w.*,c.name AS contractor_name,i.invoice_number FROM daily_work_entries w
+               JOIN contractors c ON c.id=w.contractor_id LEFT JOIN invoices i ON i.id=w.invoice_id
+               WHERE ''' + ' AND '.join(conditions) + ' ORDER BY w.work_date DESC,w.id DESC'
+    entries = [dict(row) for row in db.execute(query, params).fetchall()]
+    for row in entries:
+        row['hours_label'] = ts_hours(int(row['minutes']))
+        row['exact_line_value'] = (Decimal(int(row['minutes'])) / Decimal(60)) * parse_decimal(row['hourly_rate'] or '0')
+        row['line_value'] = q2(row['exact_line_value'])
+    total_minutes = sum(int(row['minutes']) for row in entries)
+    currencies = {str(row['currency']).upper() for row in entries}
+    total_value = sum((row['exact_line_value'] for row in entries), Decimal('0')) if len(currencies) <= 1 else None
+    contractors = [dict(row) for row in db.execute('SELECT id,name FROM contractors ORDER BY name COLLATE NOCASE').fetchall()]
+    return render_template('daily_hours.html', entries=entries, contractors=contractors, month=month,
+                           status=status, contractor_id=contractor_id, invoice_id=invoice_id,
+                           total_minutes=total_minutes, total_hours=ts_hours(total_minutes), total_value=q2(total_value) if total_value is not None else None)
+
+@app.route('/hours/new', methods=['GET', 'POST'])
+def worklog_new():
+    errors = []; entry = worklog_form_values()
+    db = get_db()
+    contractors = [dict(row) for row in db.execute('SELECT id,name FROM contractors ORDER BY name COLLATE NOCASE').fetchall()]
+    projects = [dict(row) for row in db.execute('SELECT project_number,project_name FROM projects WHERE active=1 ORDER BY project_number COLLATE NOCASE').fetchall()]
+    if request.method == 'POST':
+        try:
+            entry = worklog_data_from_form()
+            db.execute('''INSERT INTO daily_work_entries(work_date,contractor_id,work_type,project_number,description,minutes,
+                         hourly_rate,currency,notes) VALUES(?,?,?,?,?,?,?,?,?)''',
+                       (entry['work_date'],entry['contractor_id'],entry['work_type'],entry['project_number'],entry['description'],
+                        entry['minutes'],entry['hourly_rate'],entry['currency'],entry['notes']))
+            db.commit()
+            flash(f"Zapisano {ts_hours(entry['minutes'])} pracy z dnia {date_pl_filter(entry['work_date'])}.", 'success')
+            return redirect(url_for('worklog_list', month=entry['work_date'][:7], status='open'))
+        except ValueError as exc:
+            errors.append(str(exc)); entry = dict(request.form)
+    return render_template('daily_hours_form.html', entry=entry, errors=errors, contractors=contractors,
+                           projects=projects, rate_defaults=get_work_rate_defaults(), is_edit=False)
+
+@app.route('/hours/<int:entry_id>/edit', methods=['GET', 'POST'])
+def worklog_edit(entry_id: int):
+    db = get_db(); row = db.execute('SELECT * FROM daily_work_entries WHERE id=?', (entry_id,)).fetchone()
+    if row is None: abort(404)
+    if row['invoice_id'] is not None:
+        flash('Wpis przypisany do faktury jest zablokowany. Otwórz powiązaną fakturę.', 'error')
+        return redirect(url_for('invoice_view', invoice_id=row['invoice_id']))
+    errors = []; entry = worklog_form_values(dict(row))
+    contractors = [dict(r) for r in db.execute('SELECT id,name FROM contractors ORDER BY name COLLATE NOCASE').fetchall()]
+    projects = [dict(r) for r in db.execute('SELECT project_number,project_name FROM projects WHERE active=1 ORDER BY project_number COLLATE NOCASE').fetchall()]
+    if request.method == 'POST':
+        try:
+            data = worklog_data_from_form()
+            db.execute('''UPDATE daily_work_entries SET work_date=?,contractor_id=?,work_type=?,project_number=?,description=?,
+                          minutes=?,hourly_rate=?,currency=?,notes=?,updated_at=CURRENT_TIMESTAMP
+                          WHERE id=? AND invoice_id IS NULL''',
+                       (data['work_date'],data['contractor_id'],data['work_type'],data['project_number'],data['description'],data['minutes'],
+                        data['hourly_rate'],data['currency'],data['notes'],entry_id))
+            if db.execute('SELECT changes()').fetchone()[0] != 1:
+                raise ValueError('Wpis został w międzyczasie przypisany do faktury; odśwież listę.')
+            db.commit(); flash('Zapisano zmiany we wpisie godzin.', 'success')
+            return redirect(url_for('worklog_list', month=data['work_date'][:7], status='open'))
+        except ValueError as exc:
+            db.rollback(); errors.append(str(exc)); entry = dict(request.form); entry['id'] = entry_id
+    return render_template('daily_hours_form.html', entry=entry, errors=errors, contractors=contractors,
+                           projects=projects, rate_defaults=get_work_rate_defaults(), is_edit=True)
+
+@app.post('/hours/<int:entry_id>/delete')
+def worklog_delete(entry_id: int):
+    db = get_db(); row = db.execute('SELECT work_date,invoice_id FROM daily_work_entries WHERE id=?', (entry_id,)).fetchone()
+    if row is None: abort(404)
+    if row['invoice_id'] is not None:
+        flash('Wpis przypisany do faktury nie został usunięty.', 'error')
+        return redirect(url_for('invoice_view', invoice_id=row['invoice_id']))
+    db.execute('DELETE FROM daily_work_entries WHERE id=? AND invoice_id IS NULL', (entry_id,)); db.commit()
+    flash('Usunięto wpis godzin.', 'success')
+    return redirect(url_for('worklog_list', month=row['work_date'][:7], status='open'))
+
+@app.post('/hours/create-invoice')
+def worklog_create_invoice():
+    try:
+        ids = parse_work_entry_ids(request.form.getlist('entry_ids'))
+        if not ids: raise ValueError('Zaznacz wpisy godzin do faktury.')
+        work_entries_for_invoice(ids)
+    except ValueError as exc:
+        flash(str(exc), 'error')
+        return redirect(url_for('worklog_list', month=request.form.get('month') or date.today().strftime('%Y-%m')))
+    return redirect(url_for('invoice_new', work_ids=','.join(str(value) for value in ids)))
+
+@app.route('/settings/work-rates', methods=['GET', 'POST'])
+def work_rate_settings_page():
+    db = get_db()
+    errors = []
+    form = {'project_number': '', 'work_type': 'Spawanie', 'hourly_rate': '',
+            'currency': get_company()['default_currency']}
+    if request.method == 'POST':
+        if request.form.get('action') == 'delete':
+            try:
+                rate_id = int(request.form.get('rate_id', ''))
+            except (TypeError, ValueError):
+                abort(404)
+            db.execute('DELETE FROM work_rate_defaults WHERE id=?', (rate_id,))
+            db.commit()
+            flash('Usunięto domyślną stawkę.', 'success')
+            return redirect(url_for('work_rate_settings_page'))
+        form = {key: request.form.get(key, '').strip() for key in
+                ('project_number', 'work_type', 'hourly_rate', 'currency')}
+        try:
+            project_number = ts_text(form['project_number'], 'Projekt', 80, required=False)
+            work_type = form['work_type']
+            if work_type not in {'Spawanie', 'Monterka', 'Inne'}:
+                raise ValueError('Wybierz rodzaj pracy.')
+            rate = parse_decimal(form['hourly_rate'], 'stawka godzinowa')
+            if not rate.is_finite() or rate <= 0:
+                raise ValueError('Domyślna stawka musi być większa od zera.')
+            currency = form['currency'].upper()
+            if not re.fullmatch(r'[A-Z0-9]{3,6}', currency):
+                raise ValueError('Podaj poprawny kod waluty, np. CZK, EUR lub USD.')
+            existing = db.execute(
+                'SELECT id FROM work_rate_defaults WHERE project_number=? AND work_type=? AND currency=?',
+                (project_number, work_type, currency),
+            ).fetchone()
+            if existing:
+                db.execute("UPDATE work_rate_defaults SET hourly_rate=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                           (format(rate, 'f'), existing['id']))
+            else:
+                db.execute("INSERT INTO work_rate_defaults(project_number,work_type,hourly_rate,currency) VALUES(?,?,?,?)",
+                           (project_number, work_type, format(rate, 'f'), currency))
+            db.commit()
+            flash('Zapisano domyślną stawkę. Formularz godzin będzie ją podpowiadał dla tego rodzaju pracy i projektu.', 'success')
+            return redirect(url_for('work_rate_settings_page'))
+        except ValueError as exc:
+            errors.append(str(exc))
+    projects = [dict(row) for row in db.execute(
+        'SELECT project_number,project_name FROM projects WHERE active=1 ORDER BY project_number COLLATE NOCASE'
+    ).fetchall()]
+    rates = get_work_rate_defaults()
+    return render_template('work_rate_settings.html', settings_tab='work_rates', errors=errors,
+                           form=form, projects=projects, rates=rates)
+
+EMBEDDED_TEMPLATES['work_rate_settings.html'] = r"""{% extends 'base.html' %}
+{% block title %}Domyślne stawki — Ustawienia{% endblock %}
+{% block content %}
+{% include 'settings_tabs.html' %}
+<div class="page-header"><div><h1>Domyślne stawki godzinowe</h1><p class="muted">Ustaw stawki dla rodzaju pracy i opcjonalnie projektu. Przy nowym wpisie godzin aplikacja podpowie dopasowaną stawkę.</p></div></div>
+{% for error in errors %}<div class="callout warning" role="alert">{{ error }}</div>{% endfor %}
+<section class="panel"><h2>Dodaj lub zmień stawkę</h2><form method="post" class="form-panel"><input type="hidden" name="action" value="save"><div class="form-grid three">
+<label class="field"><span>Projekt (puste = dowolny)</span><input name="project_number" list="rate-projects" value="{{ form.project_number }}" maxlength="80"><datalist id="rate-projects">{% for p in projects %}<option value="{{ p.project_number }}">{{ p.project_name }}</option>{% endfor %}</datalist></label>
+<label class="field"><span>Rodzaj pracy</span><select name="work_type"><option value="Spawanie" {% if form.work_type=='Spawanie' %}selected{% endif %}>Spawanie</option><option value="Monterka" {% if form.work_type=='Monterka' %}selected{% endif %}>Monterka</option><option value="Inne" {% if form.work_type=='Inne' %}selected{% endif %}>Inne</option></select></label>
+<label class="field"><span>Stawka za godzinę</span><input type="number" name="hourly_rate" min="0.01" step="0.01" value="{{ form.hourly_rate }}" required></label>
+<label class="field"><span>Waluta</span><input name="currency" maxlength="6" value="{{ form.currency }}" required></label>
+</div><p class="small muted">Stawka bez projektu działa jako wartość ogólna dla wybranego rodzaju pracy. Stawka dla konkretnego projektu ma pierwszeństwo.</p><div class="form-actions"><button class="btn btn-primary" type="submit">Zapisz stawkę</button></div></form></section>
+<section class="panel"><h2>Zapisane stawki</h2>{% if rates %}<div class="table-wrap"><table><thead><tr><th>Projekt</th><th>Rodzaj pracy</th><th>Stawka / h</th><th></th></tr></thead><tbody>{% for r in rates %}<tr><td>{{ r.project_number or 'Dowolny projekt' }}</td><td>{{ r.work_type }}</td><td>{{ r.hourly_rate|money(r.currency) }}</td><td><form method="post"><input type="hidden" name="action" value="delete"><input type="hidden" name="rate_id" value="{{ r.id }}"><button class="btn btn-ghost" type="submit">Usuń</button></form></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">Nie ma jeszcze zapisanych stawek.</p>{% endif %}</section>
+{% endblock %}"""
+
+_rate_settings_link = " <a class=\"{% if settings_tab|default('') == 'work_rates' %}active{% endif %}\" href=\"{{ url_for('work_rate_settings_page') }}\">Stawki godzinowe</a>"
+EMBEDDED_TEMPLATES['settings_tabs.html'] = EMBEDDED_TEMPLATES['settings_tabs.html'].replace('</nav>', _rate_settings_link+'\n</nav>', 1)
+
+EMBEDDED_TEMPLATES['daily_hours.html'] = r"""{% extends 'base.html' %}
+{% block title %}Ewidencja godzin — Faktury OSVČ{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Ewidencja godzin</h1><p class="muted">Zapisuj pracę na bieżąco. Każdy wpis zachowuje projekt, rodzaj pracy i właściwą stawkę. Faktura zawiera jedną zbiorczą pozycję i łączną kwotę, bez rozpisywania godzin.</p></div><div class="button-row"><a class="btn btn-primary" href="{{ url_for('worklog_new') }}">+ Dodaj godziny</a></div></div>
+<section class="panel"><form method="get" class="form-grid three"><label class="field"><span>Miesiąc</span><input type="month" name="month" value="{{ month }}"></label><label class="field"><span>Kontrahent</span><select name="contractor_id"><option value="">Wszyscy</option>{% for c in contractors %}<option value="{{ c.id }}" {% if contractor_id|string == c.id|string %}selected{% endif %}>{{ c.name }}</option>{% endfor %}</select></label><label class="field"><span>Status</span><select name="status"><option value="open" {% if status=='open' %}selected{% endif %}>Do faktury</option><option value="invoiced" {% if status=='invoiced' %}selected{% endif %}>Zafakturowane</option><option value="all" {% if status=='all' %}selected{% endif %}>Wszystkie</option></select></label><div class="field"><span>&nbsp;</span><button class="btn btn-light" type="submit">Pokaż wpisy</button></div></form></section>
+{% if invoice_id %}<div class="callout info">Wpisy źródłowe przypisane do faktury (szczegóły pozostają w aplikacji). <a href="{{ url_for('invoice_view',invoice_id=invoice_id) }}">Wróć do faktury</a> · <a href="{{ url_for('worklog_list') }}">Wróć do ewidencji</a></div>{% endif %}
+<section class="panel"><div class="panel-header"><h2>{{ 'Pozycje ewidencji' if invoice_id else ('Wpisy za ' ~ month) }}</h2><strong>{{ total_hours }}</strong></div>
+{% if entries %}{% if not invoice_id %}<form method="post" action="{{ url_for('worklog_create_invoice') }}" id="worklog-selection"><input type="hidden" name="month" value="{{ month }}">{% endif %}
+<div class="table-wrap"><table><thead><tr>{% if not invoice_id %}<th>Do faktury</th>{% endif %}<th>Data</th><th>Kontrahent</th><th>Rodzaj pracy</th><th>Opis / projekt</th><th>Godziny</th><th>Stawka</th><th>Wartość</th><th>Faktura / akcja</th></tr></thead><tbody>
+{% for e in entries %}<tr>{% if not invoice_id %}<td>{% if not e.invoice_id %}<input type="checkbox" name="entry_ids" value="{{ e.id }}" aria-label="Wybierz wpis z {{ e.work_date|date_pl }}">{% endif %}</td>{% endif %}<td>{{ e.work_date|date_pl }}</td><td>{{ e.contractor_name }}</td><td>{{ e.work_type }}</td><td>{{ e.description }}{% if e.project_number %}<br><span class="small muted">Projekt {{ e.project_number }}</span>{% endif %}{% if e.notes %}<br><span class="small muted">{{ e.notes }}</span>{% endif %}</td><td>{{ e.hours_label }}</td><td>{{ e.hourly_rate|money(e.currency) }} / h</td><td>{{ e.line_value|money(e.currency) }}</td><td>{% if e.invoice_id %}<a href="{{ url_for('invoice_view',invoice_id=e.invoice_id) }}">{{ e.invoice_number }}</a>{% else %}<a href="{{ url_for('worklog_edit',entry_id=e.id) }}">Edytuj</a>{% endif %}</td></tr>{% endfor %}
+</tbody><tfoot><tr><td colspan="{% if not invoice_id %}5{% else %}4{% endif %}"><strong>Razem</strong></td><td><strong>{{ total_hours }}</strong></td><td></td><td><strong>{{ total_value|money(entries[0].currency) if total_value is not none else '—' }}</strong></td><td></td></tr></tfoot></table></div>
+{% if not invoice_id %}<div class="worklog-invoice-action"><p class="small muted">W jednej fakturze można połączyć wpisy tylko dla jednego kontrahenta i jednej waluty. Przed fakturą sprawdź właściwą stawkę w każdym wpisie; faktura zsumuje je w jednej pozycji.</p><button class="btn btn-primary" type="submit">Przygotuj fakturę z zaznaczonych godzin</button></div></form>{% endif %}
+{% else %}<div class="empty-state"><h3>Brak wpisów w tym widoku</h3><p>Dodaj pierwszy dzień pracy albo zmień filtr.</p><a class="btn btn-primary" href="{{ url_for('worklog_new') }}">+ Dodaj godziny</a></div>{% endif %}</section>
+{% endblock %}"""
+
+EMBEDDED_TEMPLATES['daily_hours_form.html'] = r"""{% extends 'base.html' %}
+{% block title %}{{ 'Edytuj godziny' if is_edit else 'Dodaj godziny' }} — Faktury OSVČ{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>{{ 'Edytuj wpis godzin' if is_edit else 'Dodaj dzienny wpis godzin' }}</h1><p class="muted">Jeden wpis opisuje jedną czynność w danym dniu. Możesz dodać kilka wpisów tego samego dnia.</p></div></div>
+{% for error in errors %}<div class="callout warning" role="alert">{{ error }}</div>{% endfor %}
+{% if not contractors %}<div class="callout warning">Najpierw dodaj kontrahenta. <a href="{{ url_for('contractor_new') }}">Dodaj teraz</a>.</div>{% endif %}
+<form method="post" class="panel form-panel worklog-form" id="worklog-form" data-rate-defaults='{{ rate_defaults|tojson }}'><div class="form-grid three">
+<label class="field"><span>Data pracy *</span><input type="date" name="work_date" value="{{ entry.work_date }}" required></label>
+<label class="field"><span>Kontrahent *</span><select name="contractor_id" required><option value="">— wybierz —</option>{% for c in contractors %}<option value="{{ c.id }}" {% if entry.contractor_id|string == c.id|string %}selected{% endif %}>{{ c.name }}</option>{% endfor %}</select></label>
+<label class="field"><span>Rodzaj pracy *</span><select name="work_type" required><option value="Spawanie" {% if entry.work_type=='Spawanie' %}selected{% endif %}>Spawanie</option><option value="Monterka" {% if entry.work_type=='Monterka' %}selected{% endif %}>Monterka</option><option value="Inne" {% if entry.work_type=='Inne' %}selected{% endif %}>Inne</option></select></label>
+<label class="field"><span>Projekt / zamówienie</span><input name="project_number" list="worklog-projects" value="{{ entry.project_number }}" maxlength="80"><datalist id="worklog-projects">{% for p in projects %}<option value="{{ p.project_number }}">{{ p.project_name }}</option>{% endfor %}</datalist></label>
+<label class="field span-2"><span>Opis pracy *</span><input name="description" value="{{ entry.description }}" maxlength="200" required placeholder="np. spawanie elementu lub montaż konstrukcji"></label>
+<label class="field"><span>Liczba godzin *</span><input type="number" name="hours" min="0.25" max="24" step="0.25" value="{{ entry.hours }}" required><small>Dokładność do 15 minut.</small></label>
+<label class="field"><span>Stawka za godzinę</span><input type="number" name="hourly_rate" min="0" step="0.01" value="{{ entry.hourly_rate }}"><small>Wpisz stawkę właściwą dla tego projektu i rodzaju pracy.</small></label>
+<label class="field"><span>Waluta *</span><input name="currency" value="{{ entry.currency }}" maxlength="6" required></label>
+<label class="field span-3"><span>Notatka</span><textarea name="notes" rows="3" maxlength="500">{{ entry.notes }}</textarea></label>
+</div><div class="form-actions"><a class="btn btn-ghost" href="{{ url_for('worklog_list',month=entry.work_date[:7]) }}">Anuluj</a><button class="btn btn-primary" type="submit" {% if not contractors %}disabled{% endif %}>{{ 'Zapisz zmiany' if is_edit else 'Zapisz godziny' }}</button></div></form>
+{% if is_edit %}<div class="danger-zone"><span>Wpis można usunąć, dopóki nie jest przypisany do faktury.</span><form method="post" action="{{ url_for('worklog_delete',entry_id=entry.id) }}" onsubmit="return confirm('Usunąć ten wpis godzin?')"><button class="btn btn-danger" type="submit">Usuń wpis</button></form></div>{% endif %}
+<script>
+(() => {
+  const form = document.getElementById('worklog-form');
+  if (!form) return;
+  const defaults = JSON.parse(form.dataset.rateDefaults || '[]');
+  const project = form.querySelector('[name="project_number"]');
+  const type = form.querySelector('[name="work_type"]');
+  const rate = form.querySelector('[name="hourly_rate"]');
+  const currency = form.querySelector('[name="currency"]');
+  function applyRate() {
+    const projectNumber = project.value.trim();
+    const workType = type.value;
+    const currentCurrency = currency.value.trim().toUpperCase();
+    let matches = defaults.filter(item => item.project_number === projectNumber && item.work_type === workType);
+    if (!matches.length) matches = defaults.filter(item => !item.project_number && item.work_type === workType);
+    if (!matches.length) return;
+    const selected = matches.find(item => item.currency === currentCurrency) || matches[0];
+    rate.value = selected.hourly_rate;
+    currency.value = selected.currency;
+  }
+  project.addEventListener('change', applyRate);
+  project.addEventListener('blur', applyRate);
+  type.addEventListener('change', applyRate);
+})();
+</script>
+{% endblock %}"""
+
+_invoice_form_open = '<form method="post" class="panel form-panel invoice-form" data-default-due-days="{{ company.default_due_days }}">'
+_invoice_form_with_hours = _invoice_form_open + '''
+{% if selected_work_entry_ids %}<input type="hidden" name="work_entry_ids" value="{{ selected_work_entry_ids|join(',') }}"><div class="callout info"><strong>Jedna zbiorcza pozycja.</strong> Kwota jest sumą godzin pomnożonych przez stawki zapisane przy projektach i rodzajach pracy. Szczegóły dzienne pozostają w ewidencji i nie są drukowane na fakturze.</div><label class="checkbox-row"><input type="checkbox" name="create_timesheet_from_work_entries" value="1" {% if transfer_to_timesheet %}checked{% endif %}>Po wystawieniu faktury otwórz listę godzin i przenieś do niej zaznaczone dni</label>{% endif %}'''
+if _invoice_form_open not in EMBEDDED_TEMPLATES['invoice_form.html']:
+    raise RuntimeError('invoice form insertion point missing')
+EMBEDDED_TEMPLATES['invoice_form.html'] = EMBEDDED_TEMPLATES['invoice_form.html'].replace(_invoice_form_open, _invoice_form_with_hours, 1)
+EMBEDDED_TEMPLATES['base.html'] = EMBEDDED_TEMPLATES['base.html'].replace(
+    "            <a href=\"{{ url_for('invoices_list') }}\">Faktury</a>",
+    "            <a href=\"{{ url_for('invoices_list') }}\">Faktury</a>\n            <a href=\"{{ url_for('worklog_list') }}\">Godziny</a>", 1
+)
+_invoice_hours_panel = '''<section class="panel"><div class="panel-header"><h2>Ewidencja źródłowa (szczegóły tylko w aplikacji)</h2><a href="{{ url_for('worklog_list',invoice_id=invoice.id) }}">Otwórz ewidencję</a></div><p>Łącznie: <strong>{{ ts_hours(work_entries|sum(attribute='minutes')) }}</strong>. Wpisy są zablokowane do edycji po wystawieniu faktury.</p><div class="table-wrap"><table><thead><tr><th>Data</th><th>Rodzaj</th><th>Opis</th><th>Projekt</th><th>Godziny</th><th>Stawka z ewidencji</th></tr></thead><tbody>{% for e in work_entries %}<tr><td>{{ e.work_date|date_pl }}</td><td>{{ e.work_type }}</td><td>{{ e.description }}</td><td>{{ e.project_number or '—' }}</td><td>{{ ts_hours(e.minutes) }}</td><td>{{ e.hourly_rate|money(e.currency) }} / h</td></tr>{% endfor %}</tbody></table></div></section>'''
+EMBEDDED_TEMPLATES['invoice_detail.html'] = EMBEDDED_TEMPLATES['invoice_detail.html'].replace(
+    '<div class="danger-zone paid-actions">', '{% if work_entries %}' + _invoice_hours_panel + '{% endif %}\n<div class="danger-zone paid-actions">', 1
+)
+EMBEDDED_CSS += r'''
+/* V8.10 daily hours ledger */
+.worklog-form .form-grid{align-items:start}.worklog-invoice-action{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:16px}
+.worklog-invoice-action p{margin:0;max-width:620px}.worklog-invoice-action button{white-space:nowrap}
+#worklog-selection input[type=checkbox]{width:18px;height:18px;accent-color:#811737}
+@media(max-width:700px){.worklog-invoice-action{align-items:stretch;flex-direction:column}.worklog-invoice-action button{width:100%}}
+'''
+
 # V8: wykonuj automatyczny backup dopiero po zdefiniowaniu wszystkich funkcji.
 with app.app_context():
+    daily_hours_backup_before_migration()
     ts_backup_before_migration()
     v83_backup_before_migration()
     v82_backup_before_migration()
@@ -6703,6 +7646,7 @@ with app.app_context():
     init_v82_module()
     init_v83_module()
     init_timesheets_module()
+    init_daily_hours_module()
     ensure_daily_backup()
     if REMOTE_DB_ENABLED and not upload_remote_database():
         raise RuntimeError("Nie udało się zapisać aktualizacji bazy w Supabase. Start zatrzymany; kopia lokalna zachowana.")
@@ -6850,7 +7794,7 @@ def run_v83_self_tests() -> list[str]:
             else: raise AssertionError('Przyjęto token / kurs z przyszłości')
         with app.app_context():
             db = get_db()
-            contractor_id = db.execute("INSERT INTO contractors(name,vat_id) VALUES ('TEST FX','ATU12345678')").lastrowid
+            contractor_id = db.execute("INSERT INTO contractors(name,vat_id) VALUES ('TEST FX','ATU00000000')").lastrowid
             db.commit()
         with app.test_client() as client:
             response = client.post('/invoices/new',data={
@@ -6908,7 +7852,7 @@ def run_v84_self_tests() -> list[str]:
         assert client.get(f'/invoices/{iid}/timesheet').status_code==200
         with client.session_transaction() as s: token=s['_ts_csrf']
         data={'_ts_csrf':token,'intent':'save','revision':'0','company_label':'TEST EQUANS',
-              'worker_name':'Jan Kowalski','period_start':'2026-10-05','period_end':'2026-10-08',
+              'worker_name':'Test Worker','period_start':'2026-10-05','period_end':'2026-10-08',
               'project_number':'TEST-PROJECT','rows_json':_ts_json.dumps(rows),'signature_mode':'none','reviewed':'1'}
         assert client.post(f'/invoices/{iid}/timesheet',data=data).status_code==302
         first=client.get(f'/invoices/{iid}/timesheet/pdf').data
@@ -6927,15 +7871,90 @@ def run_v84_self_tests() -> list[str]:
     return results
 
 
+def run_v85_self_tests() -> list[str]:
+    results = run_v84_self_tests()
+    test_year = 2098
+    with app.app_context():
+        db = get_db()
+        contractor_id = db.execute("INSERT INTO contractors(name) VALUES('TEST ACCOUNTANT EXPORT')").lastrowid
+        invoice_id = db.execute(
+            """INSERT INTO invoices(invoice_number,invoice_year,sequence_no,contractor_id,
+                 issue_date,supply_date,due_date,currency,czk_rate,tax_mode,status,paid_date)
+                 VALUES(?,?,9001,?,'2098-02-01','2098-02-01','2098-02-15','CZK','1','no_vat','paid','2098-02-10')""",
+            ("TEST-ACCOUNTANT-" + secrets.token_hex(4), test_year, contractor_id),
+        ).lastrowid
+        db.execute(
+            """INSERT INTO invoice_items(invoice_id,position,description,quantity,unit,unit_price,vat_rate)
+                 VALUES(?,1,'TEST INVOICE ITEM','1','pcs','1000','0')""",
+            (invoice_id,),
+        )
+        firm_id = db.execute(
+            "INSERT INTO prop_firms(name,default_tax_classification,qualification_status,dph_treatment) VALUES(?,?,?,?)",
+            ("TEST ACCOUNTANT " + secrets.token_hex(4), "s7_60", "recommended", "review"),
+        ).lastrowid
+        db.execute(
+            """INSERT INTO prop_payouts(prop_firm_id,payout_identifier,received_date,currency,
+                 gross_amount,operator_fee,net_amount,czk_rate,income_czk,linked_invoice_id,
+                 tax_classification,qualification_status,dph_treatment)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (firm_id, "TEST-PAYOUT", "2098-02-12", "USDT", "100", "5", "95", "25", "2500",
+             invoice_id, "s7_60", "recommended", "review"),
+        )
+        db.commit()
+        assert db.execute("SELECT 1 FROM tax_settings WHERE year=?", (test_year,)).fetchone() is None
+        snapshot = compute_tax_snapshot(test_year, persist_settings=False)
+        assert snapshot["welding_revenue"] == Decimal("0.00")
+        assert snapshot["prop_revenue"] == Decimal("2500.00")
+        assert snapshot["revenue"] == Decimal("2500.00")
+        assert db.execute("SELECT 1 FROM tax_settings WHERE year=?", (test_year,)).fetchone() is None
+
+    with app.test_client() as client:
+        response = client.get(f"/accountant-export.zip?year={test_year}")
+        assert response.status_code == 200, response.status_code
+        assert response.mimetype == "application/zip"
+        with zipfile.ZipFile(BytesIO(response.data)) as package:
+            names = set(package.namelist())
+            expected = {
+                f"podsumowanie_roczne_{test_year}.pdf", f"faktury_{test_year}.csv",
+                f"pozycje_faktur_{test_year}.csv", f"payouty_prop_firm_{test_year}.csv",
+                f"wydatki_{test_year}.csv", f"zaliczki_i_wplaty_{test_year}.csv",
+                f"ustawienia_kalkulatora_{test_year}.csv",
+                f"zgloszenia_DPH_{test_year}.csv", f"czytaj_przed_ksiegowym_{test_year}.txt",
+            }
+            assert expected <= names, names
+            invoice_csv = package.read(f"faktury_{test_year}.csv")
+            assert invoice_csv.startswith(b"\xef\xbb\xbf")
+            invoice_data = list(csv.DictReader(StringIO(invoice_csv.decode("utf-8-sig")), delimiter=";"))
+            linked_invoice = next(row for row in invoice_data if row["ID"] == str(invoice_id))
+            assert linked_invoice["Uwzględniona w kalkulatorze"] == "nie"
+            assert linked_invoice["ID powiązanego payoutu"]
+            payout_csv = package.read(f"payouty_prop_firm_{test_year}.csv")
+            payout_data = list(csv.DictReader(StringIO(payout_csv.decode("utf-8-sig")), delimiter=";"))
+            assert len(payout_data) == 1
+            assert payout_data[0]["Brutto CZK wg wzoru"] == "2500.00"
+            assert payout_data[0]["Uwzględniony w kalkulatorze"] == "tak"
+            settings_data = list(csv.DictReader(
+                StringIO(package.read(f"ustawienia_kalkulatora_{test_year}.csv").decode("utf-8-sig")), delimiter=";"))
+            assert any(row["Parametr ustawienia"] == "employment_tax_withheld" for row in settings_data)
+            assert package.read(f"podsumowanie_roczne_{test_year}.pdf").startswith(b"%PDF")
+            assert "nie jest zeznaniem" in package.read(f"czytaj_przed_ksiegowym_{test_year}.txt").decode("utf-8-sig").lower()
+        assert client.get("/accountant-export.zip?year=2019").status_code == 400
+    with app.app_context():
+        db = get_db()
+        assert db.execute("SELECT 1 FROM tax_settings WHERE year=?", (test_year,)).fetchone() is None
+    results.append("OK: pakiet księgowego ZIP/CSV/PDF, payout bez podwójnego przychodu i GET bez zapisu ustawień")
+    return results
+
+
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        for result in run_v84_self_tests():
+        for result in run_v85_self_tests():
             print(result)
         raise SystemExit(0)
     if MIGRATED_FROM:
         print(f"Zaimportowano dane ze starej aplikacji: {MIGRATED_FROM}")
         print(f"Nowa baza danych: {DB_PATH}")
-    print("Faktury OSVČ V8.4 — Listy godzin, styl 5 + kursy ČNB Web/PWA")
+    print("Faktury OSVČ V8.10 — Ewidencja godzin, faktury, eksport dla księgowego i kursy ČNB Web/PWA")
     print(f"Baza danych: {DB_PATH}")
     print(f"Faktury PDF: {INVOICE_PDF_DIR}")
     print(f"Supabase configured: {REMOTE_DB_ENABLED}; bucket={SUPABASE_BUCKET}; key_kind={SUPABASE_KEY_KIND}")
